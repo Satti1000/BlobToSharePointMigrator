@@ -1,0 +1,7 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/BlobToSharePointMigrator/bin/Debug/net8.0
+/BlobToSharePointMigrator/obj
+/.vs/BlobToSharePointMigratorSatti/v17
