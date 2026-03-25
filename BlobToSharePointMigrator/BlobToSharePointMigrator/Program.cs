@@ -64,6 +64,12 @@ try
 
     // Apply delta filtering
     var toMigrate = allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
+    if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
+    {
+        toMigrate = toMigrate.Take(migrationSettings.MaxFilesToMigrate).ToList();
+        logger.LogInformation("Milestone cap active: limiting run to first {Limit} files.", migrationSettings.MaxFilesToMigrate);
+    }
+
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
     if (toMigrate.Count == 0)
@@ -89,7 +95,12 @@ try
 
     // ── Step 6: Poll for completion ──────────────────────
     logger.LogInformation("STEP 5/5 — Polling migration job status (this may take several minutes for large batches)...");
-    var finalJobInfo = await spService.PollMigrationJobAsync(jobInfo.JobId);
+    var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
+    var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
+    var finalJobInfo = await spService.PollMigrationJobAsync(
+        jobInfo.JobId,
+        TimeSpan.FromMinutes(timeoutMinutes),
+        pollIntervalSeconds * 1000);
 
     // ── Step 6b: Cleanup staging containers ──────────────
     await spService.CleanupStagingContainersAsync();

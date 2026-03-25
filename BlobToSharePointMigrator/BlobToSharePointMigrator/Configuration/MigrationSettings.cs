@@ -18,4 +18,8 @@ public class MigrationSettings
 	public string SharePointCertificatePath        { get; set; } = string.Empty;
 	public string SharePointCertificatePassword    { get; set; } = string.Empty;
 	public string SharePointCertificateThumbprint  { get; set; } = string.Empty;
+    public int UploadParallelism            { get; set; } = 8;
+    public int MaxFilesToMigrate            { get; set; } = 0;
+    public int JobPollIntervalSeconds       { get; set; } = 10;
+    public int JobTimeoutMinutes            { get; set; } = 60;
 }

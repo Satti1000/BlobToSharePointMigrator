@@ -218,14 +218,25 @@ public class SharePointMigrationService
         _logger.LogInformation("Uploading {Count} source files (encrypted) to SharePoint data container...", records.Count);
 
         var dataContainer = new BlobContainerClient(new Uri(dataContainerUri));
+        var uploadParallelism = Math.Max(1, _settings.UploadParallelism);
+        _logger.LogInformation("Data upload parallelism: {Parallelism}", uploadParallelism);
+        var uploadedCount = 0;
 
-        foreach (var record in records)
-        {
-            var targetPath = record.MappedPath.Replace('\\', '/').TrimStart('/');
-            await using var stream = await blobDownloader(record.BlobPath);
-            await UploadEncryptedBlobAsync(dataContainer, targetPath, stream);
-            _logger.LogDebug("Uploaded: {Path}", targetPath);
-        }
+        await Parallel.ForEachAsync(
+            records,
+            new ParallelOptions { MaxDegreeOfParallelism = uploadParallelism },
+            async (record, _) =>
+            {
+                var targetPath = record.MappedPath.Replace('\\', '/').TrimStart('/');
+                await using var stream = await blobDownloader(record.BlobPath);
+                await UploadEncryptedBlobAsync(dataContainer, targetPath, stream);
+
+                var finished = Interlocked.Increment(ref uploadedCount);
+                if (finished % 100 == 0 || finished == records.Count)
+                {
+                    _logger.LogInformation("Data upload progress: {Uploaded}/{Total}", finished, records.Count);
+                }
+            });
 
         _logger.LogInformation("All source files uploaded.");
 
