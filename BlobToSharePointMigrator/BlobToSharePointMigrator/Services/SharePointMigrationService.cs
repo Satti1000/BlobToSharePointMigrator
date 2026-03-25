@@ -7,6 +7,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Identity.Client;
 using Microsoft.SharePoint.Client;
+using PnP.Framework;
 using System.Diagnostics;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
@@ -29,7 +30,6 @@ public class SharePointMigrationService
     private readonly MigrationSettings _settings;
     private IConfigurationSection _processFlags;
     private readonly ILogger<SharePointMigrationService> _logger;
-    private ClientContext _clientContextX = null!;
     private ClientContext _clientContextG = null!;
     private Site _site = null!;
     private Web _web = null!;
@@ -51,6 +51,8 @@ public class SharePointMigrationService
     private string GetTenantName()
     {
         var url = _processFlags.GetSection("AdminUrl").Value;
+        if (string.IsNullOrWhiteSpace(url))
+            throw new InvalidOperationException("AdminUrl is not configured under SimpleETL:AdminUrl.");
         return new Uri(url).Host.Split('.')[0];
     }
 
@@ -61,106 +63,76 @@ public class SharePointMigrationService
     /// <returns></returns>
     public async Task ConnectAsync()
     {
-        _logger.LogInformation("Connecting to SharePoint: {Url}", _settings.SharePointSiteUrl);
+        // Prefer certificate-based app-only auth for CSOM + SPMI (matches README + avoids scope/audience mistakes).
+        var siteUrl = _processFlags.GetSection("SHAREPOINT_SITE_URL").Value?.Trim();
+        if (string.IsNullOrWhiteSpace(siteUrl))
+            siteUrl = _settings.SharePointSiteUrl?.Trim();
 
-        string tenantId = _settings.SharePointTenantId;  
-        string clientId = _settings.SharePointClientId; 
-        string tenantName = _processFlags.GetSection("SHAREPOINT_TENANT_NAME").Value; 
-        string clientSecret = _processFlags.GetSection("SHAREPOINT_CLIENT_SECRET").Value;
-        string siteUrl = _processFlags.GetSection("SHAREPOINT_SITE_URL").Value;
+        if (string.IsNullOrWhiteSpace(siteUrl))
+            throw new InvalidOperationException("SharePoint site url not configured. Set SimpleETL:SHAREPOINT_SITE_URL or Migration:SharePointSiteUrl.");
 
-        // Authority (Entra ID endpoint)
-        string authority = $"https://login.microsoftonline.com/{_settings.SharePointTenantId}";
-        // Scope (IMPORTANT: always tenant root + .default)
-        string[] scopes = new[]
+        _logger.LogInformation("Connecting to SharePoint (PnP.Framework CSOM app-only): {Url}", siteUrl);
+
+        var certificate = LoadCertificate(_settings);
+        var authManager = new AuthenticationManager(
+            _settings.SharePointClientId,
+            certificate,
+            _settings.SharePointTenantId);
+
+        // IMPORTANT: do NOT wrap this in a using; we need it for the rest of the pipeline.
+        _clientContextG = await authManager.GetContextAsync(siteUrl).ConfigureAwait(false);
+
+        // Load site, web, and target document library metadata
+        _site = _clientContextG.Site;
+        _web = _clientContextG.Web;
+        _clientContextG.Load(_site, s => s.Id, s => s.Url);
+        _clientContextG.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
+        await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+
+        _siteId = _site.Id.ToString();
+        _webId = _web.Id.ToString();
+
+        _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}, Title: {Title}", _siteId, _webId, _web.Title);
+
+        // Resolve the target document library
+        var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
+        _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
+        _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
+        await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+
+        _listId = list.Id.ToString();
+        _rootFolderId = list.RootFolder.UniqueId.ToString();
+        _rootFolderUrl = list.RootFolder.ServerRelativeUrl.TrimStart('/'); // e.g. "Shared Documents"
+
+        _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
+            _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
+    }
+
+    private static X509Certificate2 LoadCertificate(MigrationSettings settings)
+    {
+        if (!string.IsNullOrWhiteSpace(settings.SharePointCertificatePath))
         {
-            $"https://{tenantName}.sharepoint.com/.default"
-        };
-         
-        try
-        {
-            // Build confidential client
-            IConfidentialClientApplication app = ConfidentialClientApplicationBuilder
-                .Create(clientId)
-                .WithClientSecret(clientSecret)
-                .WithAuthority(new Uri(authority))
-                .Build();
-
-            try
-            {
-                // Acquire token
-                AuthenticationResult result = await app
-                    .AcquireTokenForClient(scopes)
-                    .ExecuteAsync();
-
-                string accessToken = result.AccessToken;
-
-                // Connect to SharePoint using CSOM
-                using (ClientContext context = new ClientContext(siteUrl))
-                {
-                    context.ExecutingWebRequest += (sender, e) =>
-                    {
-                        e.WebRequestExecutor.RequestHeaders["Authorization"] =
-                            "Bearer " + accessToken;
-                    };
-
-                    // Example: read site title
-                    Web web = context.Web;
-                    context.Load(web);
-                    context.ExecuteQuery();
-
-                    Console.WriteLine("Connected to site: " + web.Title);
-                     
-                    // Load site, web, and target document library metadata
-                    _site = context.Site;
-                    _web = context.Web;
-                    context.Load(_site, s => s.Id, s => s.Url);
-                    context.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
-                    await context.ExecuteQueryAsync();
-
-                    _siteId = _site.Id.ToString();
-                    _webId = _web.Id.ToString();
-
-                    _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}", _siteId, _webId);
-
-                    // Resolve the target document library
-                    var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
-                    context.Load(list, l => l.Id, l => l.RootFolder);
-                    context.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-                    await context.ExecuteQueryAsync();
-
-                    _listId = list.Id.ToString();
-                    _rootFolderId = list.RootFolder.UniqueId.ToString();
-                    _rootFolderUrl = list.RootFolder.ServerRelativeUrl.TrimStart('/'); // e.g. "Shared Documents"
-
-                    _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
-                        _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
-
-                    _clientContextG = context;
-
-                }
-            }
-            catch (MsalServiceException ex)
-            {
-                Console.WriteLine("Token error: " + ex.Message);
-            }
-            catch (ServerException ex)
-            {
-                Console.WriteLine("SharePoint error: " + ex.Message);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("General error: " + ex.Message);
-            }
-             
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError("Error in context: {Url}", ex.Message);
+            return new X509Certificate2(
+                settings.SharePointCertificatePath,
+                settings.SharePointCertificatePassword,
+                X509KeyStorageFlags.EphemeralKeySet);
         }
 
+        if (!string.IsNullOrWhiteSpace(settings.SharePointCertificateThumbprint))
+        {
+            using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+            store.Open(OpenFlags.ReadOnly);
+            var matches = store.Certificates.Find(
+                X509FindType.FindByThumbprint,
+                settings.SharePointCertificateThumbprint.Replace(" ", string.Empty),
+                validOnly: false);
 
-        
+            if (matches.Count > 0)
+                return matches[0];
+        }
+
+        throw new InvalidOperationException(
+            "Certificate not configured. Provide Migration:SharePointCertificatePath (+Password) or Migration:SharePointCertificateThumbprint.");
     }
 
 
