@@ -141,7 +141,8 @@ try
 }
 catch (Exception ex)
 {
-    logger.LogCritical("Pipeline failed: {Error}", ex.Message);
+    logger.LogCritical(ex, "Pipeline failed.");
     Console.WriteLine($"\n✗ Fatal error: {ex.Message}");
+    Console.WriteLine(ex.ToString());
     Environment.Exit(1);
 }

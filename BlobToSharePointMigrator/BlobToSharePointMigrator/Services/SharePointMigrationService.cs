@@ -9,6 +9,7 @@ using Microsoft.Identity.Client;
 using Microsoft.SharePoint.Client;
 using PnP.Framework;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
 
@@ -308,34 +309,50 @@ public class SharePointMigrationService
 
         while (sw.Elapsed < timeout)
         {
-            var statusResult = _site.GetMigrationJobStatus(jobId);
-            await _clientContextG.ExecuteQueryAsync();
+            ClientResult<MigrationJobState>? statusResult = null;
+            try
+            {
+                statusResult = _site.GetMigrationJobStatus(jobId);
+                await _clientContextG.ExecuteQueryAsync();
+            }
+            catch (Exception ex) when (IsTransientRequestError(ex))
+            {
+                _logger.LogWarning(ex, "Transient polling error for job {JobId}; continuing.", jobId);
+                await Task.Delay(pollIntervalMs);
+                continue;
+            }
 
-            var state = statusResult.Value;
+            var state = statusResult!.Value;
             _logger.LogInformation("Job {JobId} — State: {State}", jobId, state);
 
             if (state is MigrationJobState.Queued or MigrationJobState.Processing)
             {
                 wasActive = true;
             }
-            else if (state == MigrationJobState.None && wasActive)
+            else if (state == MigrationJobState.None)
             {
-                // Job finished — read queue messages for details
-                _logger.LogInformation("Migration job {JobId} finished. Reading queue report...", jobId);
-                var (status, errors) = await ReadQueueReportAsync(jobId);
-                return new MigrationJobInfo
+                // SharePoint sometimes returns None without a clear transition. We use the migration queue
+                // to determine whether we reached a final event (JobEnd/JobError).
+                _logger.LogInformation("Job {JobId} returned State=None. Reading queue report...", jobId);
+                var (queueStatus, errors) = await ReadQueueReportAsync(jobId);
+
+                if (queueStatus is "Completed" or "CompletedWithErrors")
                 {
-                    JobId = jobId,
-                    Status = status,
-                    Progress = 100,
-                    CreatedDateTime = DateTime.UtcNow.ToString("O"),
-                    Errors = errors
-                };
-            }
-            else if (state == MigrationJobState.None && !wasActive)
-            {
-                // First poll returned None — job may not have started yet, or was instant
-                _logger.LogDebug("Job {JobId} not yet visible, waiting...", jobId);
+                    _logger.LogInformation("Migration job {JobId} finalized with queueStatus={Status}.", jobId, queueStatus);
+                    return new MigrationJobInfo
+                    {
+                        JobId = jobId,
+                        Status = queueStatus,
+                        Progress = 100,
+                        CreatedDateTime = DateTime.UtcNow.ToString("O"),
+                        Errors = errors
+                    };
+                }
+
+                if (wasActive)
+                    _logger.LogInformation("Job {JobId} was active but final queue event not found yet; continuing to poll.", jobId);
+                else
+                    _logger.LogInformation("Job {JobId} not yet finalised (State=None, no final queue event); continuing to poll.", jobId);
             }
 
             await Task.Delay(pollIntervalMs);
@@ -362,13 +379,23 @@ public class SharePointMigrationService
     private async Task<(string status, List<string> errors)> ReadQueueReportAsync(Guid jobId)
     {
         var errors = new List<string>();
-        var status = "Completed";
+        var status = "InProgress";
+        bool sawFinalEvent = false;
 
         if (string.IsNullOrEmpty(_queueUri))
             return (status, errors);
 
         var queueClient = new QueueClient(new Uri(_queueUri));
-        var messages = await queueClient.ReceiveMessagesAsync(maxMessages: 32);
+        Azure.Response<Azure.Storage.Queues.Models.QueueMessage[]> messages;
+        try
+        {
+            messages = await queueClient.ReceiveMessagesAsync(maxMessages: 32);
+        }
+        catch (Exception ex) when (IsTransientRequestError(ex))
+        {
+            _logger.LogWarning(ex, "Transient queue-read error while checking job {JobId}.", jobId);
+            return (status, errors);
+        }
 
         foreach (var msg in messages.Value)
         {
@@ -382,6 +409,22 @@ public class SharePointMigrationService
                 var eventType = json["Event"]?.ToString() ?? "";
                 var message = json["Message"]?.ToString()
                            ?? json["ErrorMessage"]?.ToString() ?? "";
+                var jobIdInMessage = json["JobId"]?.ToString();
+
+                // Best-effort filter to only process messages for our job.
+                if (!string.IsNullOrWhiteSpace(jobIdInMessage) &&
+                    !string.Equals(jobIdInMessage, jobId.ToString(), StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
+                    eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
+                    decrypted.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
+                    decrypted.Contains("JobError", StringComparison.OrdinalIgnoreCase))
+                {
+                    sawFinalEvent = true;
+                }
 
                 if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
@@ -397,10 +440,22 @@ public class SharePointMigrationService
             }
         }
 
-        if (errors.Count > 0)
-            status = "CompletedWithErrors";
+        if (sawFinalEvent)
+            status = errors.Count > 0 ? "CompletedWithErrors" : "Completed";
 
         return (status, errors);
+    }
+
+    private static bool IsTransientRequestError(Exception ex)
+    {
+        if (ex is HttpRequestException || ex is TaskCanceledException)
+            return true;
+
+        if (ex is Microsoft.SharePoint.Client.ClientRequestException crex &&
+            crex.Message.Contains("while sending the request", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return ex.InnerException is HttpRequestException;
     }
 
     /// <summary>
