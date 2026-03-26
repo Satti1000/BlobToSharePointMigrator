@@ -352,18 +352,20 @@ public class SharePointMigrationService
                 // SharePoint sometimes returns None without a clear transition. We use the migration queue
                 // to determine whether we reached a final event (JobEnd/JobError).
                 _logger.LogInformation("Job {JobId} returned State=None. Reading queue report...", jobId);
-                var (queueStatus, errors) = await ReadQueueReportAsync(jobId);
+                var queueSummary = await ReadQueueReportAsync(jobId);
 
-                if (queueStatus is "Completed" or "CompletedWithErrors")
+                if (queueSummary.Status is "Completed" or "CompletedWithErrors" or "Failed")
                 {
-                    _logger.LogInformation("Migration job {JobId} finalized with queueStatus={Status}.", jobId, queueStatus);
+                    _logger.LogInformation("Migration job {JobId} finalized with queueStatus={Status}.", jobId, queueSummary.Status);
                     return new MigrationJobInfo
                     {
                         JobId = jobId,
-                        Status = queueStatus,
+                        Status = queueSummary.Status,
                         Progress = 100,
                         CreatedDateTime = DateTime.UtcNow.ToString("O"),
-                        Errors = errors
+                        ProcessedFileCount = queueSummary.FilesCreated,
+                        FailedFileCount = queueSummary.TotalErrors,
+                        Errors = queueSummary.Errors
                     };
                 }
 
@@ -394,14 +396,12 @@ public class SharePointMigrationService
     /// <summary>
     /// Reads migration job report messages from the Azure Queue to get actual success/failure details.
     /// </summary>
-    private async Task<(string status, List<string> errors)> ReadQueueReportAsync(Guid jobId)
+    private async Task<QueueSummary> ReadQueueReportAsync(Guid jobId)
     {
-        var errors = new List<string>();
-        var status = "InProgress";
-        bool sawFinalEvent = false;
+        var summary = new QueueSummary();
 
         if (string.IsNullOrEmpty(_queueUri))
-            return (status, errors);
+            return summary;
 
         var queueClient = new QueueClient(new Uri(_queueUri));
         Azure.Response<Azure.Storage.Queues.Models.QueueMessage[]> messages;
@@ -412,7 +412,7 @@ public class SharePointMigrationService
         catch (Exception ex) when (IsTransientRequestError(ex))
         {
             _logger.LogWarning(ex, "Transient queue-read error while checking job {JobId}.", jobId);
-            return (status, errors);
+            return summary;
         }
 
         foreach (var msg in messages.Value)
@@ -441,15 +441,26 @@ public class SharePointMigrationService
                     decrypted.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
                     decrypted.Contains("JobError", StringComparison.OrdinalIgnoreCase))
                 {
-                    sawFinalEvent = true;
+                    summary.SawFinalEvent = true;
+                }
+
+                if (eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase))
+                {
+                    summary.SawFatalError = true;
                 }
 
                 if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase))
                 {
-                    errors.Add($"[{eventType}] {message}");
+                    summary.Errors.Add($"[{eventType}] {message}");
                     _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, message);
+                }
+
+                if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))
+                {
+                    summary.FilesCreated = ParseInt(json["FilesCreated"]?.ToString());
+                    summary.TotalErrors = ParseInt(json["TotalErrors"]?.ToString());
                 }
             }
             catch (Exception ex)
@@ -458,10 +469,32 @@ public class SharePointMigrationService
             }
         }
 
-        if (sawFinalEvent)
-            status = errors.Count > 0 ? "CompletedWithErrors" : "Completed";
+        if (summary.SawFinalEvent)
+        {
+            if (summary.SawFatalError || summary.FilesCreated == 0)
+                summary.Status = "Failed";
+            else if (summary.Errors.Count > 0 || summary.TotalErrors > 0)
+                summary.Status = "CompletedWithErrors";
+            else
+                summary.Status = "Completed";
+        }
 
-        return (status, errors);
+        return summary;
+    }
+
+    private sealed class QueueSummary
+    {
+        public string Status { get; set; } = "InProgress";
+        public List<string> Errors { get; } = new();
+        public bool SawFinalEvent { get; set; }
+        public bool SawFatalError { get; set; }
+        public int FilesCreated { get; set; }
+        public int TotalErrors { get; set; }
+    }
+
+    private static int ParseInt(string? value)
+    {
+        return int.TryParse(value, out var parsed) ? parsed : 0;
     }
 
     private static bool IsTransientRequestError(Exception ex)

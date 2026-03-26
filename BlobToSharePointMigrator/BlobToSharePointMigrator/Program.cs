@@ -18,12 +18,18 @@ var config = new ConfigurationBuilder()
     .AddEnvironmentVariables()
     .Build();
 
-var settings = config.GetSection("SimpleETL") 
-    ?? throw new InvalidOperationException("settings not found in appsettings.json");
+var migrationSection = config.GetSection("Migration");
+if (!migrationSection.Exists())
+    migrationSection = config.GetSection("SimpleETL");
+if (!migrationSection.Exists())
+    throw new InvalidOperationException("Neither 'Migration' nor 'SimpleETL' section was found in appsettings.json");
 
+var settings = config.GetSection("SimpleETL");
+if (!settings.Exists())
+    settings = migrationSection;
 
-var migrationSettings = config.GetSection("Migration").Get<MigrationSettings>()
-    ?? throw new InvalidOperationException("Migration settings not found in appsettings.json");
+var migrationSettings = migrationSection.Get<MigrationSettings>()
+    ?? throw new InvalidOperationException("Migration settings could not be bound from 'Migration' or 'SimpleETL' section.");
 
 
 // ── Dependency Injection ─────────────────────────────────
@@ -108,17 +114,29 @@ try
     // Build results from job status
      
     var results = new List<BlobToSharePointMigrator.Models.MigrationResult>();
+    var markAllFailed = finalJobInfo.Status == "Failed" ||
+                        (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
+    var firstError = finalJobInfo.Errors.FirstOrDefault() ?? string.Empty;
+
     foreach (var record in toMigrate)
     {
+        var rowStatus = markAllFailed
+            ? "Failed"
+            : finalJobInfo.Status == "Completed"
+                ? "Success"
+                : finalJobInfo.Status == "CompletedWithErrors"
+                    ? "PartialSuccess"
+                    : "Failed";
+
         var result = new BlobToSharePointMigrator.Models.MigrationResult
         {
             SourceFile = record.BlobPath,
             DestPath = record.MappedPath,
             SizeBytes = record.SizeBytes,
             LastModified = record.LastModified,
-            Status = finalJobInfo.Status == "Completed" ? "Success" :
-                     finalJobInfo.Status == "CompletedWithErrors" ? "PartialSuccess" : "Failed",
+            Status = rowStatus,
             SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{migrationSettings.SharePointDocumentLibrary}/{record.MappedPath}",
+            Error = rowStatus == "Failed" ? firstError : string.Empty,
             Duration = "N/A (batch operation)"
         };
         results.Add(result);
