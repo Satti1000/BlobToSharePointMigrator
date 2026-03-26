@@ -116,7 +116,14 @@ try
     var results = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var markAllFailed = finalJobInfo.Status == "Failed" ||
                         (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
-    var firstError = finalJobInfo.Errors.FirstOrDefault() ?? string.Empty;
+    var firstError = finalJobInfo.Errors
+        .FirstOrDefault(e =>
+            e.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("Fatal", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("not found", StringComparison.OrdinalIgnoreCase))
+        ?? finalJobInfo.Errors.FirstOrDefault()
+        ?? string.Empty;
 
     foreach (var record in toMigrate)
     {
