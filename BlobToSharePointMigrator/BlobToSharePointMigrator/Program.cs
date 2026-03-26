@@ -22,7 +22,7 @@ var settings = config.GetSection("SimpleETL")
     ?? throw new InvalidOperationException("settings not found in appsettings.json");
 
 
-var migrationSettings = config.GetSection("SimpleETL").Get<MigrationSettings>()
+var migrationSettings = config.GetSection("Migration").Get<MigrationSettings>()
     ?? throw new InvalidOperationException("Migration settings not found in appsettings.json");
 
 
