@@ -103,7 +103,25 @@ public class SharePointMigrationService
 
         _listId = list.Id.ToString();
         _rootFolderId = list.RootFolder.UniqueId.ToString();
-        _rootFolderUrl = list.RootFolder.ServerRelativeUrl.TrimStart('/'); // e.g. "Shared Documents"
+
+        // Normalize to web-relative library root for SPMI manifest URLs.
+        // Example:
+        //   list.RootFolder.ServerRelativeUrl = "sites/sharepointmigration/Shared Documents"
+        //   _web.ServerRelativeUrl            = "sites/sharepointmigration"
+        //   _rootFolderUrl                    = "Shared Documents"
+        // Without this, SharePoint import can duplicate site path and fail:
+        //   ".../sites/sharepointmigration/sites/sharepointmigration/Shared Documents/General"
+        var listRootServerRelative = list.RootFolder.ServerRelativeUrl.Trim('/');
+        var webServerRelative = _web.ServerRelativeUrl.Trim('/');
+        if (!string.IsNullOrWhiteSpace(webServerRelative) &&
+            listRootServerRelative.StartsWith(webServerRelative + "/", StringComparison.OrdinalIgnoreCase))
+        {
+            _rootFolderUrl = listRootServerRelative[(webServerRelative.Length + 1)..];
+        }
+        else
+        {
+            _rootFolderUrl = listRootServerRelative;
+        }
 
         _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
             _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
