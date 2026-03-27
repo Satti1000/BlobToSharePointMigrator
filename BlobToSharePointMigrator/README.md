@@ -38,16 +38,18 @@ AZURE BLOB STORAGE          MIGRATION APP (.NET 8)        SHAREPOINT ONLINE
 
 ### 1. App Registration (Azure Portal)
 
-1. Go to **Microsoft Entra ID** → **App registrations** → **New registration**
+1. Go to **Microsoft Entra ID** -> **App registrations** -> **New registration**
 2. Name it `BlobToSharePointMigrator`
 3. Note the **Tenant ID**, **Client ID**
-4. Go to **Certificates & secrets** → **Certificates** tab → **Upload certificate**
+4. Go to **Certificates & secrets** -> **Certificates** tab -> **Upload certificate**
    - Upload your `.pfx` certificate file
    - Note the **Thumbprint**
-5. Go to **API permissions** → **Add permission**:
-   - Select **SharePoint** → **Application permissions**
+5. Go to **API permissions** -> **Add permission**:
+   - Select **SharePoint** -> **Application permissions**
    - Add `Sites.FullControl.All`
 6. Click **Grant admin consent**
+
+Note: `Sites.FullControl.All` is what this implementation is currently tested with. Permissions can be reduced later after security review and validation.
 
 ### 2. Configure appsettings.json
 
@@ -80,6 +82,7 @@ Primary destination naming now follows DynamicETL rule:
 
 - Source pattern contains a `YYYY` segment and `<CaseNumber>_Documents`
 - Destination becomes: `YYYY/<CaseNumber>/<everything after _Documents>`
+- The `YYYY` value is taken from the year segment in the source blob path format used by this migration.
 
 Example:
 
@@ -127,20 +130,22 @@ Log path and retention are controlled in `appsettings.json` under `Serilog:Write
 
 **Latest refactoring (2026):** The upload layer has been rebuilt to use SharePoint Migration API instead of per-file REST uploads.
 
-### Performance Impact
+### Performance Impact (reference only)
 
-| Scenario | Before (REST API) | After (SPMI) | Improvement |
+| Scenario | Before (REST API) | After (SPMI) | Typical improvement |
 | --- | --- | --- | --- |
-| 100 files | 5 minutes | 1 minute | **5x faster** |
-| 1,000 files | 1 hour | 5 minutes | **12x faster** |
+| 100 files | 5 minutes | 1 minute | About 5x faster |
+| 1,000 files | 1 hour | 5 minutes | About 12x faster |
 | 5,000 files | Throttled (not reliable) | 25 minutes | Works in batch mode |
+
+These numbers are examples from test runs. Actual duration depends on tenant load, SharePoint backend processing time, source file mix, and network throughput.
 
 ### Key Benefits
 
-- **No throttling** — Bypasses per-request API limits by batching
-- **Async processing** — SharePoint processes files on their backend
-- **Scalable** — Handles millions of files (tested to 50M+)
-- **Reliable** — Single job submission vs. thousands of individual calls
+- **Reduced throttling risk** - Bypasses per-request API limits by batching
+- **Async processing** - SharePoint processes files on their backend
+- **Scalable** - Handles very large file sets
+- **Reliable** - Single job submission vs. thousands of individual calls
 
 ### What's Different?
 
@@ -148,9 +153,9 @@ Log path and retention are controlled in `appsettings.json` under `Serilog:Write
 
 ```
 For each of 5000 files:
-  → Create folder (if needed)
-  → Upload file via REST API
-  → Wait for response
+  -> Create folder (if needed)
+  -> Upload file via REST API
+  -> Wait for response
 Result: Throttled after ~500 files
 ```
 
@@ -158,9 +163,9 @@ Result: Throttled after ~500 files
 
 ```
 Generate manifest of all 5000 files
-→ Submit migration job (1 API call)
-→ SharePoint processes asynchronously
-→ Poll for completion
+-> Submit migration job (1 API call)
+-> SharePoint processes asynchronously
+-> Poll for completion
 Result: All 5000 files done in 20-30 minutes
 ```
 
