@@ -1,17 +1,20 @@
 using BlobToSharePointMigrator.Models;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using System.Text.RegularExpressions;
 
 namespace BlobToSharePointMigrator.Services;
 
 public class PathTransformService
 {
     private readonly MappingConfig _mappingConfig;
+    private readonly bool _useYyyyCaseNumberPath;
     private readonly ILogger<PathTransformService> _logger;
 
-    public PathTransformService(string mappingFilePath, ILogger<PathTransformService> logger)
+    public PathTransformService(string mappingFilePath, bool useYyyyCaseNumberPath, ILogger<PathTransformService> logger)
     {
         _logger = logger;
+        _useYyyyCaseNumberPath = useYyyyCaseNumberPath;
         var json = File.ReadAllText(mappingFilePath);
         _mappingConfig = JsonConvert.DeserializeObject<MappingConfig>(json)
             ?? throw new InvalidOperationException("Failed to load mapping.json");
@@ -21,6 +24,17 @@ public class PathTransformService
     public string Transform(string blobPath)
     {
         var normalizedBlobPath = blobPath.Replace('\\', '/').Trim('/');
+
+        if (_useYyyyCaseNumberPath)
+        {
+            var yyyyCasePath = TransformToYyyyCaseNumberPath(normalizedBlobPath);
+            if (!string.IsNullOrWhiteSpace(yyyyCasePath))
+            {
+                _logger.LogDebug("Mapped (YYYY/CaseNumber): {Source} -> {Destination}", blobPath, yyyyCasePath);
+                return yyyyCasePath;
+            }
+        }
+
         var fileName  = Path.GetFileName(normalizedBlobPath);
         var directory = normalizedBlobPath.Contains('/')
             ? normalizedBlobPath[..normalizedBlobPath.LastIndexOf('/')]
@@ -89,5 +103,40 @@ public class PathTransformService
         var ext = Path.GetExtension(mappedPath);
         var withoutExt = mappedPath[..^ext.Length];
         return $"{withoutExt}__dup{duplicateIndex}{ext}";
+    }
+
+    private static string? TransformToYyyyCaseNumberPath(string blobPath)
+    {
+        var segments = blobPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 3)
+            return null;
+
+        var year = segments[2];
+        if (!Regex.IsMatch(year, @"^\d{4}$"))
+            return null;
+
+        string? caseNumber = null;
+        var documentsIndex = -1;
+        for (int i = 0; i < segments.Length; i++)
+        {
+            var match = Regex.Match(segments[i], @"^(\d+)_Documents$", RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                caseNumber = match.Groups[1].Value;
+                documentsIndex = i;
+                break;
+            }
+        }
+
+        if (documentsIndex < 0 || string.IsNullOrWhiteSpace(caseNumber))
+            return null;
+
+        var rest = documentsIndex + 1 < segments.Length
+            ? string.Join("/", segments[(documentsIndex + 1)..])
+            : string.Empty;
+
+        return string.IsNullOrEmpty(rest)
+            ? $"{year}/{caseNumber}"
+            : $"{year}/{caseNumber}/{rest}";
     }
 }

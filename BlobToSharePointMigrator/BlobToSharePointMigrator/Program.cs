@@ -3,20 +3,30 @@ using BlobToSharePointMigrator.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Serilog;
 
 Console.WriteLine();
-Console.WriteLine("═══════════════════════════════════════════════════");
+Console.WriteLine("===================================================");
 Console.WriteLine("   Blob-to-SharePoint ETL Migration Pipeline");
 Console.WriteLine("   .NET 8 | SharePoint Migration API");
-Console.WriteLine("═══════════════════════════════════════════════════");
+Console.WriteLine("===================================================");
 Console.WriteLine();
 
-// ── Configuration ────────────────────────────────────────
 var config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false)
     .AddEnvironmentVariables()
     .Build();
+
+var configurationForSerilog = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .AddEnvironmentVariables()
+    .Build();
+
+Log.Logger = new LoggerConfiguration()
+    .ReadFrom.Configuration(configurationForSerilog)
+    .CreateLogger();
 
 var migrationSection = config.GetSection("Migration");
 if (!migrationSection.Exists())
@@ -31,35 +41,33 @@ if (!settings.Exists())
 var migrationSettings = migrationSection.Get<MigrationSettings>()
     ?? throw new InvalidOperationException("Migration settings could not be bound from 'Migration' or 'SimpleETL' section.");
 
-
-// ── Dependency Injection ─────────────────────────────────
 var services = new ServiceCollection()
-	.AddLogging(b => b
-		.AddConsole()
-		.SetMinimumLevel(LogLevel.Information))
+    .AddLogging(b => b
+        .ClearProviders()
+        .AddSerilog(Log.Logger, dispose: false)
+        .SetMinimumLevel(LogLevel.Information))
     .BuildServiceProvider();
 
 var loggerFactory = services.GetRequiredService<ILoggerFactory>();
 
-// ── Services ─────────────────────────────────────────────
-var blobService  = new BlobInventoryService(settings, migrationSettings, loggerFactory.CreateLogger<BlobInventoryService>());
-var transformSvc = new PathTransformService(Path.Combine(AppContext.BaseDirectory, migrationSettings.MappingFile), loggerFactory.CreateLogger<PathTransformService>());
-var spService    = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
-var reportSvc    = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
+var blobService = new BlobInventoryService(settings, migrationSettings, loggerFactory.CreateLogger<BlobInventoryService>());
+var transformSvc = new PathTransformService(
+    Path.Combine(AppContext.BaseDirectory, migrationSettings.MappingFile),
+    migrationSettings.UseYyyyCaseNumberPath,
+    loggerFactory.CreateLogger<PathTransformService>());
+var spService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
 try
 {
-    // ── Step 1: Load delta tracking ───────────────────────
     reportSvc.LoadDeltaTracking();
 
-    // ── Step 2: Inventory blobs ───────────────────────────
-    logger.LogInformation("STEP 1/5 — Inventorying Azure Blob Storage...");
+    logger.LogInformation("STEP 1/5 - Inventorying Azure Blob Storage...");
     var records = await blobService.InventoryAsync();
 
-    // ── Step 3: Transform paths ───────────────────────────
-    logger.LogInformation("STEP 2/5 — Transforming folder paths...");
+    logger.LogInformation("STEP 2/5 - Transforming folder paths...");
     transformSvc.TransformAll(records);
 
     var allowed = records.Where(r => r.IsAllowed).ToList();
@@ -68,7 +76,6 @@ try
     foreach (var s in skipped)
         logger.LogInformation("Skipped: {File} ({Reason})", s.BlobPath, s.SkipReason);
 
-    // Apply delta filtering
     var toMigrate = allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
     if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
     {
@@ -86,21 +93,15 @@ try
         Environment.Exit(0);
     }
 
-    // ── Step 4: Connect to SharePoint ─────────────────────
-    logger.LogInformation("STEP 3/5 — Connecting to SharePoint...");
+    logger.LogInformation("STEP 3/5 - Connecting to SharePoint...");
     await spService.ConnectAsync();
 
-    // ── Step 5: Submit migration job ─────────────────────
-    logger.LogInformation("STEP 4/5 — Submitting migration job for {Count} files via SharePoint Migration API...", toMigrate.Count);
-
-    var jobInfo = await spService.SubmitMigrationJobAsync(
-        toMigrate,
-        blobService.DownloadBlobAsync);
+    logger.LogInformation("STEP 4/5 - Submitting migration job for {Count} files via SharePoint Migration API...", toMigrate.Count);
+    var jobInfo = await spService.SubmitMigrationJobAsync(toMigrate, blobService.DownloadBlobAsync);
 
     logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
-    // ── Step 6: Poll for completion ──────────────────────
-    logger.LogInformation("STEP 5/5 — Polling migration job status (this may take several minutes for large batches)...");
+    logger.LogInformation("STEP 5/5 - Polling migration job status (this may take several minutes for large batches)...");
     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
     var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
     var finalJobInfo = await spService.PollMigrationJobAsync(
@@ -108,11 +109,8 @@ try
         TimeSpan.FromMinutes(timeoutMinutes),
         pollIntervalSeconds * 1000);
 
-    // ── Step 6b: Cleanup staging containers ──────────────
     await spService.CleanupStagingContainersAsync();
 
-    // Build results from job status
-     
     var results = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var markAllFailed = finalJobInfo.Status == "Failed" ||
                         (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
@@ -152,12 +150,11 @@ try
             reportSvc.TrackMigrated(record);
     }
 
-    // ── Step 7: Save report & tracking ───────────────────
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(results);
     reportSvc.PrintSummary(results, skipped);
 
-    logger.LogInformation("");
+    logger.LogInformation(string.Empty);
     logger.LogInformation("Migration complete!");
     logger.LogInformation("Job Status: {Status}", finalJobInfo.Status);
     logger.LogInformation("Files Processed: {Processed}/{Total}",
@@ -167,7 +164,11 @@ try
 catch (Exception ex)
 {
     logger.LogCritical(ex, "Pipeline failed.");
-    Console.WriteLine($"\n✗ Fatal error: {ex.Message}");
+    Console.WriteLine($"\nFatal error: {ex.Message}");
     Console.WriteLine(ex.ToString());
     Environment.Exit(1);
+}
+finally
+{
+    Log.CloseAndFlush();
 }

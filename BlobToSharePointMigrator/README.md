@@ -6,26 +6,26 @@ A .NET 8 C# console application that migrates documents from **Azure Blob Storag
 
 ```
 AZURE BLOB STORAGE          MIGRATION APP (.NET 8)        SHAREPOINT ONLINE
-─────────────────           ──────────────────────        ─────────────────
-• Documents container  ───► • Inventory & filter    ───► • Document Library
-• Metadata tags             • Extract metadata           • Custom metadata
-• File properties           • Transform paths            • Preserved integrity
-                            • Upload via SP API
-                            • Log & report
+- Documents container   ->  - Inventory & filter     ->  - Document Library
+- Metadata tags             - Extract metadata            - Custom metadata
+- File properties           - Transform paths             - Preserved integrity
+                             - Upload via SP API
+                             - Log and report
 ```
 
 ## Features
 
-- ✅ Reads directly from existing Azure Blob container
-- ✅ Filters by file type (PDF, CSV, HTML — no images/video)
-- ✅ Transforms folder structure via configurable mapping table
-- ✅ **Batch uploads via SharePoint Migration API (SPMI)** — no throttling
-- ✅ Handles **5000+ files** without per-request throttling (tested to millions)
-- ✅ Preserves blob metadata as SharePoint column values
-- ✅ Full progress logging and CSV confirmation report
-- ✅ Delta reload support — reruns skip unchanged files
-- ✅ App-only authentication via **certificate-based OAuth** (Tenant ID + Client ID + Certificate)
-- ✅ Deployable as Azure Container Instance (up to 3 hours runtime)
+- Reads directly from existing Azure Blob container
+- Filters by file type (PDF, CSV, HTML; no images/video)
+- Transforms folder structure via configurable mapping table
+- Batch uploads via SharePoint Migration API (SPMI) with reduced throttling impact
+- Handles 5000+ files without per-request upload loops
+- Preserves blob metadata as SharePoint column values
+- Full progress logging and CSV confirmation report
+- Delta reload support; reruns skip unchanged files
+- App-only authentication via certificate-based OAuth (Tenant ID + Client ID + Certificate)
+- Deployable as Azure Container Instance (up to 3 hours runtime)
+- Serilog rolling file logs for detailed run diagnostics
 
 ## Requirements
 
@@ -66,14 +66,31 @@ Copy `appsettings.template.json` to `appsettings.json` and fill in your values:
     "SharePointSiteUrl":           "https://yourtenant.sharepoint.com",
     "SharePointDocumentLibrary":   "Shared Documents",
     "AllowedExtensions":           [".pdf", ".csv", ".html"],
-    "DeltaMode":                   false
+    "DeltaMode":                   false,
+    "UseYyyyCaseNumberPath":       true
   }
 }
 ```
 
-**⚠️ IMPORTANT:** `appsettings.json` is in `.gitignore` — never commit credentials. Use `appsettings.template.json` as reference.
+IMPORTANT: `appsettings.json` is in `.gitignore`; never commit credentials. Use `appsettings.template.json` as reference.
 
-### 3. Configure mapping.json
+### 3. Path rule (primary mode)
+
+Primary destination naming now follows DynamicETL rule:
+
+- Source pattern contains a `YYYY` segment and `<CaseNumber>_Documents`
+- Destination becomes: `YYYY/<CaseNumber>/<everything after _Documents>`
+
+Example:
+
+- Source blob  
+  `Wilerforce/Final_InactiveCases_01Feb2026_doc/2025/MXX/NRM_Cases_2377/CaseNumberFolder/23771_Documents/EVERYTHING/a.xml`
+- Destination path  
+  `2025/23771/EVERYTHING/a.xml`
+
+When the pattern is not found, the app falls back to `mapping.json` mapping.
+
+### 4. Configure mapping.json
 
 ```json
 {
@@ -100,11 +117,13 @@ dotnet run
 
 | File | Description |
 |------|-------------|
-| `migration-log.txt`    | Full timestamped log |
+| `logs/etl-YYYYMMDD.log` | Serilog rolling daily log (primary detailed log) |
 | `migration-report.csv` | Per-file results with SharePoint URLs |
 | `migrated-files.json`  | Delta tracking state |
 
-## ⚡ SharePoint Migration API (SPMI) — What Changed?
+Log path and retention are controlled in `appsettings.json` under `Serilog:WriteTo`.
+
+## SharePoint Migration API (SPMI) - What Changed?
 
 **Latest refactoring (2026):** The upload layer has been rebuilt to use SharePoint Migration API instead of per-file REST uploads.
 
@@ -114,7 +133,7 @@ dotnet run
 | --- | --- | --- | --- |
 | 100 files | 5 minutes | 1 minute | **5x faster** |
 | 1,000 files | 1 hour | 5 minutes | **12x faster** |
-| 5,000 files | ❌ Throttled (won't work) | 25 minutes | **✅ Now works** |
+| 5,000 files | Throttled (not reliable) | 25 minutes | Works in batch mode |
 
 ### Key Benefits
 
@@ -132,7 +151,7 @@ For each of 5000 files:
   → Create folder (if needed)
   → Upload file via REST API
   → Wait for response
-Result: Throttled after ~500 files ❌
+Result: Throttled after ~500 files
 ```
 
 **New approach (batch via SPMI):**
@@ -142,7 +161,7 @@ Generate manifest of all 5000 files
 → Submit migration job (1 API call)
 → SharePoint processes asynchronously
 → Poll for completion
-Result: All 5000 files done in 20-30 minutes ✅
+Result: All 5000 files done in 20-30 minutes
 ```
 
 ### For Existing Users

@@ -64,21 +64,21 @@ public class ReportService
         var failed   = results.Count(r => r.Status == "Failed");
 
         Console.WriteLine();
-        Console.WriteLine("═══════════════════════════════════════════════════");
+        Console.WriteLine("===================================================");
         Console.WriteLine("   MIGRATION COMPLETE");
-        Console.WriteLine("═══════════════════════════════════════════════════");
+        Console.WriteLine("===================================================");
         Console.WriteLine($"   Succeeded  : {success}");
         Console.WriteLine($"   Partial    : {partial}");
         Console.WriteLine($"   Failed     : {failed}");
         Console.WriteLine($"   Skipped    : {skipped.Count}");
         Console.WriteLine($"   Report     : {_settings.ReportFile}");
-        Console.WriteLine("═══════════════════════════════════════════════════");
+        Console.WriteLine("===================================================");
         Console.WriteLine();
 
         if (results.Any())
         {
             Console.WriteLine($"{"Source File",-35} {"Destination",-40} {"Status",-10} {"Size",10}");
-            Console.WriteLine(new string('─', 100));
+            Console.WriteLine(new string('-', 100));
             foreach (var r in results)
                 Console.WriteLine($"{r.SourceFile,-35} {r.DestPath,-40} {r.Status,-10} {r.SizeBytes,10}");
         }
@@ -88,7 +88,7 @@ public class ReportService
             Console.WriteLine();
             Console.WriteLine("Failures:");
             foreach (var r in results.Where(r => r.Status == "Failed"))
-                Console.WriteLine($"  ✗ {r.SourceFile}: {r.Error}");
+                Console.WriteLine($"  - {r.SourceFile}: {r.Error}");
         }
     }
 }

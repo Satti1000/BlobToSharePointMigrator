@@ -391,7 +391,7 @@ public class SharePointMigrationService
         return Task.CompletedTask;
     }
 
-    // ─── Queue Reporting ──────────────────────────────────────────────
+    // Queue reporting
 
     /// <summary>
     /// Reads migration job report messages from the Azure Queue to get actual success/failure details.
@@ -532,7 +532,7 @@ public class SharePointMigrationService
         return System.Text.Encoding.UTF8.GetString(decryptedBytes);
     }
 
-    // ─── Manifest Generation ─────────────────────────────────────────
+    // Manifest generation
 
     /// <summary>
     /// Generates all 8 required XML manifest files for the SPMI package.
@@ -757,7 +757,7 @@ public class SharePointMigrationService
         return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────
+    // Helpers
 
     /// <summary>
     /// Generates a deterministic GUID from a string path so that folder/file IDs

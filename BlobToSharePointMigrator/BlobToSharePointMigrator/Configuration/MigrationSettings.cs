@@ -22,4 +22,5 @@ public class MigrationSettings
     public int MaxFilesToMigrate            { get; set; } = 0;
     public int JobPollIntervalSeconds       { get; set; } = 10;
     public int JobTimeoutMinutes            { get; set; } = 60;
+    public bool UseYyyyCaseNumberPath       { get; set; } = true;
 }
