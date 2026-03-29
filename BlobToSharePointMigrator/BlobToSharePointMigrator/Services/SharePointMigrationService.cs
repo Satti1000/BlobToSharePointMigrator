@@ -162,52 +162,7 @@ public class SharePointMigrationService
         throw new InvalidOperationException(
             "Certificate not configured. Provide Migration:SharePointCertificatePath (+Password) or Migration:SharePointCertificateThumbprint.");
     }
-
-
-    /// <summary>
-
-    /// </summary>
-    //public async Task ConnectAsync1()
-    //{
-    //    _logger.LogInformation("Connecting to SharePoint: {Url}", _settings.SharePointSiteUrl);
-
-    //    var certificate = new X509Certificate2(
-    //        _settings.SharePointCertificatePath,
-    //        _settings.SharePointCertificatePassword,
-    //        X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.PersistKeySet);
-
-    //    var authManager = new PnP.Framework.AuthenticationManager(
-    //        _settings.SharePointClientId,
-    //        certificate,
-    //        _settings.SharePointTenantId);
-
-    //    _clientContext = await authManager.GetContextAsync(_settings.SharePointSiteUrl);
-
-    //    // Load site, web, and target document library metadata
-    //    _site = _clientContext.Site;
-    //    _web = _clientContext.Web;
-    //    _clientContext.Load(_site, s => s.Id, s => s.Url);
-    //    _clientContext.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
-    //    await _clientContext.ExecuteQueryAsync();
-
-    //    _siteId = _site.Id.ToString();
-    //    _webId = _web.Id.ToString();
-
-    //    _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}", _siteId, _webId);
-
-    //    // Resolve the target document library
-    //    var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
-    //    _clientContext.Load(list, l => l.Id, l => l.RootFolder);
-    //    _clientContext.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-    //    await _clientContext.ExecuteQueryAsync();
-
-    //    _listId = list.Id.ToString();
-    //    _rootFolderId = list.RootFolder.UniqueId.ToString();
-    //    _rootFolderUrl = list.RootFolder.ServerRelativeUrl.TrimStart('/'); // e.g. "Shared Documents"
-
-    //    _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
-    //        _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
-    //}
+     
 
     /// <summary>
     /// Runs the full SPMI migration pipeline:
@@ -818,5 +773,4 @@ public class SharePointMigrationService
         var hash = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(input));
         return new Guid(hash);
     }
-
 }
