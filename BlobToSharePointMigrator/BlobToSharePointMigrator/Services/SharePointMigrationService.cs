@@ -64,67 +64,76 @@ public class SharePointMigrationService
     /// <returns></returns>
     public async Task ConnectAsync()
     {
-        // Prefer certificate-based app-only auth for CSOM + SPMI (matches README + avoids scope/audience mistakes).
-        var siteUrl = _processFlags.GetSection("SHAREPOINT_SITE_URL").Value?.Trim();
-        if (string.IsNullOrWhiteSpace(siteUrl))
-            siteUrl = _settings.SharePointSiteUrl?.Trim();
-
-        if (string.IsNullOrWhiteSpace(siteUrl))
-            throw new InvalidOperationException("SharePoint site url not configured. Set SimpleETL:SHAREPOINT_SITE_URL or Migration:SharePointSiteUrl.");
-
-        _logger.LogInformation("Connecting to SharePoint (PnP.Framework CSOM app-only): {Url}", siteUrl);
-
-        var certificate = LoadCertificate(_settings);
-        var authManager = new AuthenticationManager(
-            _settings.SharePointClientId,
-            certificate,
-            _settings.SharePointTenantId);
-
-        // IMPORTANT: do NOT wrap this in a using; we need it for the rest of the pipeline.
-        _clientContextG = await authManager.GetContextAsync(siteUrl).ConfigureAwait(false);
-
-        // Load site, web, and target document library metadata
-        _site = _clientContextG.Site;
-        _web = _clientContextG.Web;
-        _clientContextG.Load(_site, s => s.Id, s => s.Url);
-        _clientContextG.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
-        await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
-
-        _siteId = _site.Id.ToString();
-        _webId = _web.Id.ToString();
-
-        _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}, Title: {Title}", _siteId, _webId, _web.Title);
-
-        // Resolve the target document library
-        var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
-        _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
-        _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-        await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
-
-        _listId = list.Id.ToString();
-        _rootFolderId = list.RootFolder.UniqueId.ToString();
-
-        // Normalize to web-relative library root for SPMI manifest URLs.
-        // Example:
-        //   list.RootFolder.ServerRelativeUrl = "sites/sharepointmigration/Shared Documents"
-        //   _web.ServerRelativeUrl            = "sites/sharepointmigration"
-        //   _rootFolderUrl                    = "Shared Documents"
-        // Without this, SharePoint import can duplicate site path and fail:
-        //   ".../sites/sharepointmigration/sites/sharepointmigration/Shared Documents/General"
-        var listRootServerRelative = list.RootFolder.ServerRelativeUrl.Trim('/');
-        var webServerRelative = _web.ServerRelativeUrl.Trim('/');
-        if (!string.IsNullOrWhiteSpace(webServerRelative) &&
-            listRootServerRelative.StartsWith(webServerRelative + "/", StringComparison.OrdinalIgnoreCase))
+        try
         {
-            _rootFolderUrl = listRootServerRelative[(webServerRelative.Length + 1)..];
+            // Prefer certificate-based app-only auth for CSOM + SPMI (matches README + avoids scope/audience mistakes).
+            var siteUrl = _processFlags.GetSection("SHAREPOINT_SITE_URL").Value?.Trim();
+            if (string.IsNullOrWhiteSpace(siteUrl))
+                siteUrl = _settings.SharePointSiteUrl?.Trim();
+
+            if (string.IsNullOrWhiteSpace(siteUrl))
+                throw new InvalidOperationException("SharePoint site url not configured. Set SimpleETL:SHAREPOINT_SITE_URL or Migration:SharePointSiteUrl.");
+
+            _logger.LogInformation("Connecting to SharePoint (PnP.Framework CSOM app-only): {Url}", siteUrl);
+
+            var certificate = LoadCertificate(_settings);
+            var authManager = new AuthenticationManager(
+                _settings.SharePointClientId,
+                certificate,
+                _settings.SharePointTenantId);
+
+            // IMPORTANT: do NOT wrap this in a using; we need it for the rest of the pipeline.
+            _clientContextG = await authManager.GetContextAsync(siteUrl).ConfigureAwait(false);
+
+            // Load site, web, and target document library metadata
+            _site = _clientContextG.Site;
+            _web = _clientContextG.Web;
+            _clientContextG.Load(_site, s => s.Id, s => s.Url);
+            _clientContextG.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
+            await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+
+            _siteId = _site.Id.ToString();
+            _webId = _web.Id.ToString();
+
+            _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}, Title: {Title}", _siteId, _webId, _web.Title);
+
+            // Resolve the target document library
+            var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
+            _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
+            _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
+            await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+
+            _listId = list.Id.ToString();
+            _rootFolderId = list.RootFolder.UniqueId.ToString();
+
+            // Normalize to web-relative library root for SPMI manifest URLs.
+            // Example:
+            //   list.RootFolder.ServerRelativeUrl = "sites/sharepointmigration/Shared Documents"
+            //   _web.ServerRelativeUrl            = "sites/sharepointmigration"
+            //   _rootFolderUrl                    = "Shared Documents"
+            // Without this, SharePoint import can duplicate site path and fail:
+            //   ".../sites/sharepointmigration/sites/sharepointmigration/Shared Documents/General"
+            var listRootServerRelative = list.RootFolder.ServerRelativeUrl.Trim('/');
+            var webServerRelative = _web.ServerRelativeUrl.Trim('/');
+            if (!string.IsNullOrWhiteSpace(webServerRelative) &&
+                listRootServerRelative.StartsWith(webServerRelative + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                _rootFolderUrl = listRootServerRelative[(webServerRelative.Length + 1)..];
+            }
+            else
+            {
+                _rootFolderUrl = listRootServerRelative;
+            }
+
+            _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
+                _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
         }
-        else
+        catch (Exception ex)
         {
-            _rootFolderUrl = listRootServerRelative;
+            _logger.LogError("Error reading Target library: {Library})", ex.Message);
+            throw;
         }
 
-        _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
-            _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
     }
 
     private static X509Certificate2 LoadCertificate(MigrationSettings settings)

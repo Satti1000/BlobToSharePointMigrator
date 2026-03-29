@@ -54,7 +54,7 @@ public class BlobInventoryService
                     continue;
 
                 var ext = Path.GetExtension(blob.Name).ToLowerInvariant();
-                var allowed = allowedExtensions.Contains(ext);
+                var allowed = true; // allowedExtensions.Contains(ext);
                 var skipReason = allowed ? string.Empty : $"Extension '{ext}' not in allowed list";
 
                 var record = new FileRecord
