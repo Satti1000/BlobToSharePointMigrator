@@ -637,7 +637,6 @@ public class SharePointMigrationService
                 : GenerateDeterministicGuid(fileParentPath).ToString();
 
             // FileValue = blob name in the data container (must match what we uploaded)
-            var metaInfo = BuildMetaInfoElement(ns, record.Metadata);
             root.Add(new XElement(ns + "SPObject",
                 new XAttribute("Id", fileId),
                 new XAttribute("ObjectType", "SPFile"),
@@ -658,37 +657,10 @@ public class SharePointMigrationService
                     new XAttribute("Version", "1.0"),
                     new XAttribute("FileValue", targetPath),
                     new XAttribute("Author", "1"),
-                    new XAttribute("ModifiedBy", "1"),
-                    metaInfo)));
+                    new XAttribute("ModifiedBy", "1"))));
         }
 
         return XmlToString(new XDocument(new XDeclaration("1.0", "utf-8", null), root));
-    }
-
-    private static XElement BuildMetaInfoElement(XNamespace ns, IDictionary<string, string>? metadata)
-    {
-        // SPMI import supports MetaInfo properties in the manifest.
-        // We include blob metadata as best-effort name/value pairs.
-        var meta = new XElement(ns + "MetaInfo");
-
-        if (metadata == null || metadata.Count == 0)
-            return meta;
-
-        foreach (var kvp in metadata)
-        {
-            var name = (kvp.Key ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(name))
-                continue;
-
-            // Keep values non-null; SharePoint import is picky about invalid XML chars.
-            var value = kvp.Value ?? string.Empty;
-
-            meta.Add(new XElement(ns + "Property",
-                new XAttribute("Name", name),
-                value));
-        }
-
-        return meta;
     }
 
     private string GenerateRequirements()
