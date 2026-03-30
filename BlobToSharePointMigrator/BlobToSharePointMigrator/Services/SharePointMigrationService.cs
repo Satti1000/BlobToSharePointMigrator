@@ -244,6 +244,8 @@ public class SharePointMigrationService
         var uploadParallelism = Math.Max(1, _settings.UploadParallelism);
         _logger.LogInformation("Data upload parallelism: {Parallelism}", uploadParallelism);
         var uploadedCount = 0;
+        var uploadSw = Stopwatch.StartNew();
+        var totalToUpload = validRecords.Count;
 
         await Parallel.ForEachAsync(
             validRecords,
@@ -255,13 +257,21 @@ public class SharePointMigrationService
                 await UploadEncryptedBlobAsync(dataContainer, targetPath, stream);
 
                 var finished = Interlocked.Increment(ref uploadedCount);
-                if (finished % 100 == 0 || finished == validRecords.Count)
+                if (finished % 250 == 0 || finished == validRecords.Count)
                 {
-                    _logger.LogInformation("Data upload progress: {Uploaded}/{Total}", finished, validRecords.Count);
+                    var elapsed = uploadSw.Elapsed.TotalSeconds;
+                    var rate = elapsed > 0 ? finished / elapsed : 0;
+                    var remaining = Math.Max(0, totalToUpload - finished);
+                    var etaSeconds = rate > 0 ? remaining / rate : double.NaN;
+                    var eta = TimeSpan.FromSeconds(double.IsNaN(etaSeconds) ? 0 : etaSeconds);
+                    _logger.LogInformation("Data upload progress: {Uploaded}/{Total} | {Rate}/s | ETA {Eta}",
+                        finished, totalToUpload, rate.ToString("0.0"), eta.ToString(@"mm\:ss"));
                 }
             });
 
-        _logger.LogInformation("All source files uploaded.");
+        _logger.LogInformation("All source files uploaded. Duration: {Duration}s, Avg rate: {Rate}/s",
+            uploadSw.Elapsed.TotalSeconds.ToString("0.0"),
+            (totalToUpload / Math.Max(1, uploadSw.Elapsed.TotalSeconds)).ToString("0.0"));
 
         // Step 3: Generate manifest XMLs
         var webUrl = _web.ServerRelativeUrl.TrimEnd('/');
@@ -329,6 +339,7 @@ public class SharePointMigrationService
         _logger.LogInformation("Polling migration job {JobId} (timeout: {Timeout}min)...",
             jobId, timeout.Value.TotalMinutes);
 
+        var lastElapsedLog = TimeSpan.Zero;
         while (sw.Elapsed < timeout)
         {
             ClientResult<MigrationJobState>? statusResult = null;
@@ -346,6 +357,16 @@ public class SharePointMigrationService
 
             var state = statusResult!.Value;
             _logger.LogInformation("Job {JobId} — State: {State}", jobId, state);
+
+            // Emit periodic elapsed time markers so the console shows forward progress even if
+            // the state remains Processing for a long time on SharePoint side.
+            var elapsed = sw.Elapsed;
+            if (elapsed - lastElapsedLog >= TimeSpan.FromMinutes(1))
+            {
+                lastElapsedLog = elapsed;
+                _logger.LogInformation("Polling {JobId} — Elapsed: {Elapsed} (timeout at {Timeout} min)",
+                    jobId, $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s", (int)timeout.Value.TotalMinutes);
+            }
 
             if (state is MigrationJobState.Queued or MigrationJobState.Processing)
             {
@@ -637,7 +658,7 @@ public class SharePointMigrationService
                 : GenerateDeterministicGuid(fileParentPath).ToString();
 
             // FileValue = blob name in the data container (must match what we uploaded)
-            root.Add(new XElement(ns + "SPObject",
+            var fileElement = new XElement(ns + "SPObject",
                 new XAttribute("Id", fileId),
                 new XAttribute("ObjectType", "SPFile"),
                 new XAttribute("ParentId", fileParentId),
@@ -657,7 +678,33 @@ public class SharePointMigrationService
                     new XAttribute("Version", "1.0"),
                     new XAttribute("FileValue", targetPath),
                     new XAttribute("Author", "1"),
-                    new XAttribute("ModifiedBy", "1"))));
+                    new XAttribute("ModifiedBy", "1")));
+
+            // Optional: include metadata as Properties under File when explicitly enabled and mapped
+            if (_settings.EnableMetadataProperties && record.Metadata is { Count: > 0 })
+            {
+                var properties = new XElement(ns + "Properties");
+                foreach (var kvp in record.Metadata)
+                {
+                    if (string.IsNullOrWhiteSpace(kvp.Key)) continue;
+                    if (!_settings.MetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
+                        string.IsNullOrWhiteSpace(fieldInternalName))
+                    {
+                        continue; // only mapped keys are emitted
+                    }
+                    var value = kvp.Value ?? string.Empty;
+                    properties.Add(new XElement(ns + "Property",
+                        new XAttribute("Name", fieldInternalName),
+                        value));
+                }
+
+                if (properties.HasElements)
+                {
+                    fileElement.Element(ns + "File")!.Add(properties);
+                }
+            }
+
+            root.Add(fileElement);
         }
 
         return XmlToString(new XDocument(new XDeclaration("1.0", "utf-8", null), root));

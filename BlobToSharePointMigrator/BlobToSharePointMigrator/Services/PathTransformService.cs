@@ -9,6 +9,7 @@ public class PathTransformService
 {
     private readonly MappingConfig _mappingConfig;
     private readonly bool _useYyyyCaseNumberPath;
+    // Future: dynamic ETL rules switchable via config. For now, behaves like default mapping.
     private readonly ILogger<PathTransformService> _logger;
     private static readonly Regex InvalidSharePointChars = new Regex(@"[~""#%&\*\{\}\\:<>\?/+\|]", RegexOptions.Compiled);
 

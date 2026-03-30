@@ -23,4 +23,7 @@ public class MigrationSettings
     public int JobPollIntervalSeconds       { get; set; } = 10;
     public int JobTimeoutMinutes            { get; set; } = 60;
     public bool UseYyyyCaseNumberPath       { get; set; } = true;
+    public int MaxParallelJobs              { get; set; } = 3;
+    public bool EnableMetadataProperties    { get; set; } = false;
+    public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName
 }
