@@ -31,13 +31,11 @@ Log.Logger = new LoggerConfiguration()
 
 var migrationSection = config.GetSection("Migration");
 if (!migrationSection.Exists())
-    migrationSection = config.GetSection("SimpleETL");
-if (!migrationSection.Exists())
-    throw new InvalidOperationException("Neither 'Migration' nor 'SimpleETL' section was found in appsettings.json");
+    throw new InvalidOperationException("'Migration' section was not found in appsettings.json");
 
 var settings = config.GetSection("SimpleETL");
 if (!settings.Exists())
-    settings = migrationSection;
+    throw new InvalidOperationException("'SimpleETL' section was not found in appsettings.json");
 
 var migrationSettings = migrationSection.Get<MigrationSettings>()
     ?? throw new InvalidOperationException("Migration settings could not be bound from 'Migration' or 'SimpleETL' section.");

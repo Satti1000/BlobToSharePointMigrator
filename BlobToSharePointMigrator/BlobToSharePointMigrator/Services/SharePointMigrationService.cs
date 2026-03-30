@@ -222,19 +222,50 @@ public class SharePointMigrationService
 
         // Step 1: Provision SharePoint-managed migration containers + queue
         _logger.LogInformation("Provisioning SharePoint migration containers and queue...");
-        var containersResult = _site.ProvisionMigrationContainers();
-        var queueResult = _site.ProvisionMigrationQueue();
-        await _clientContextG.ExecuteQueryAsync();
 
-        var containers = containersResult.Value;
-        var dataContainerUri = containers.DataContainerUri;
-        var metadataContainerUri = containers.MetadataContainerUri;
-        var queueUri = queueResult.Value.JobQueueUri;
+        string? dataContainerUri = null;
+        string? metadataContainerUri = null;
+        string? queueUri = null;
+        bool provisioned = false;
+
+        for (int attempt = 1; attempt <= 3 && !provisioned; attempt++)
+        {
+            try
+            {
+                var containersResult = _site.ProvisionMigrationContainers();
+                var queueResult = _site.ProvisionMigrationQueue();
+                await _clientContextG.ExecuteQueryAsync();
+
+                var containers = containersResult?.Value;
+                dataContainerUri = containers?.DataContainerUri;
+                metadataContainerUri = containers?.MetadataContainerUri;
+                queueUri = queueResult?.Value?.JobQueueUri;
+                _encryptionKey = containers?.EncryptionKey ?? Array.Empty<byte>();
+
+                provisioned = !string.IsNullOrWhiteSpace(dataContainerUri)
+                              && !string.IsNullOrWhiteSpace(metadataContainerUri)
+                              && !string.IsNullOrWhiteSpace(queueUri)
+                              && _encryptionKey.Length > 0;
+
+                if (!provisioned)
+                {
+                    _logger.LogWarning("Provision attempt {Attempt}/3 did not return valid URIs. Retrying in 2s...", attempt);
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                }
+            }
+            catch (Exception ex) when (IsTransientRequestError(ex))
+            {
+                _logger.LogWarning(ex, "Transient error provisioning migration containers (attempt {Attempt}/3). Retrying in 2s...", attempt);
+                await Task.Delay(TimeSpan.FromSeconds(2));
+            }
+        }
+
+        if (!provisioned)
+            throw new InvalidOperationException("Failed to provision SharePoint migration containers/queue. Verify site permissions and try again.");
 
         _logger.LogInformation("Data container provisioned: {Uri}", dataContainerUri.Split('?')[0]);
         _logger.LogInformation("Metadata container provisioned: {Uri}", metadataContainerUri.Split('?')[0]);
         _queueUri = queueUri;
-        _encryptionKey = containers.EncryptionKey;
         _logger.LogInformation("Report queue provisioned.");
 
         // Step 2: Upload source files to the data container (AES-encrypted)
@@ -294,10 +325,7 @@ public class SharePointMigrationService
         // Provisioned containers require encryption — pass the key from ProvisionMigrationContainers
         _logger.LogInformation("Calling CreateMigrationJobEncrypted (Web ID: {WebId})...", _web.Id);
 
-        var encryptionOption = new EncryptionOption
-        {
-            AES256CBCKey = containers.EncryptionKey
-        };
+        var encryptionOption = new EncryptionOption { AES256CBCKey = _encryptionKey };
 
         var jobIdResult = _site.CreateMigrationJobEncrypted(
             _web.Id,
