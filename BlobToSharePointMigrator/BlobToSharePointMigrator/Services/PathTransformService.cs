@@ -185,7 +185,18 @@ public class PathTransformService
 
     internal static bool ContainsInvalidSharePointChars(string path)
     {
-        var normalized = (path ?? string.Empty).Replace('\\', '/');
-        return InvalidSharePointChars.IsMatch(normalized);
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return false;
+
+        // Validate per-segment so path separators do not trigger false positives.
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var segment in segments)
+        {
+            if (InvalidSharePointChars.IsMatch(segment))
+                return true;
+        }
+
+        return false;
     }
 }
