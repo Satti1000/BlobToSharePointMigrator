@@ -10,6 +10,7 @@ public class PathTransformService
     private readonly MappingConfig _mappingConfig;
     private readonly bool _useYyyyCaseNumberPath;
     private readonly ILogger<PathTransformService> _logger;
+    private static readonly Regex InvalidSharePointChars = new Regex(@"[~""#%&\*\{\}\\:<>\?/+\|]", RegexOptions.Compiled);
 
     public PathTransformService(string mappingFilePath, bool useYyyyCaseNumberPath, ILogger<PathTransformService> logger)
     {
@@ -30,8 +31,9 @@ public class PathTransformService
             var yyyyCasePath = TransformToYyyyCaseNumberPath(normalizedBlobPath);
             if (!string.IsNullOrWhiteSpace(yyyyCasePath))
             {
-                _logger.LogDebug("Mapped (YYYY/CaseNumber): {Source} -> {Destination}", blobPath, yyyyCasePath);
-                return yyyyCasePath;
+                var safe = SanitizeSharePointRelativePath(yyyyCasePath);
+                _logger.LogDebug("Mapped (YYYY/CaseNumber): {Source} -> {Destination}", blobPath, safe);
+                return safe;
             }
         }
 
@@ -71,8 +73,9 @@ public class PathTransformService
             ? $"{destinationRoot}/{fileName}"
             : $"{destinationRoot}/{relativeDir}/{fileName}";
 
-        _logger.LogDebug("Mapped: {Source} -> {Destination}", blobPath, mappedPath);
-        return mappedPath;
+        var safeMapped = SanitizeSharePointRelativePath(mappedPath);
+        _logger.LogDebug("Mapped: {Source} -> {Destination}", blobPath, safeMapped);
+        return safeMapped;
     }
 
     public List<FileRecord> TransformAll(List<FileRecord> records)
@@ -138,5 +141,51 @@ public class PathTransformService
         return string.IsNullOrEmpty(rest)
             ? $"{year}/{caseNumber}"
             : $"{year}/{caseNumber}/{rest}";
+    }
+    
+    internal static string SanitizeSharePointRelativePath(string path)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var safeSegments = new List<string>(segments.Length);
+
+        foreach (var seg in segments)
+        {
+            var s = seg.Trim();
+
+            // Replace invalid characters (SharePoint/URL + SPMI strictness)
+            s = InvalidSharePointChars.Replace(s, "_");
+
+            // SharePoint disallows segments ending in dot, and often rejects trailing spaces too.
+            s = s.Trim().TrimEnd('.');
+
+            // Collapse whitespace
+            s = Regex.Replace(s, @"\s+", " ").Trim();
+
+            if (string.IsNullOrWhiteSpace(s))
+                s = "_";
+
+            // Best-effort cap; long segments can fail in import with opaque errors.
+            const int maxSegmentLength = 128;
+            if (s.Length > maxSegmentLength)
+            {
+                // Keep start, add short hash to reduce collisions
+                var hash = Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(s)).ToString("X");
+                s = s[..Math.Max(1, maxSegmentLength - (hash.Length + 1))] + "-" + hash;
+            }
+
+            safeSegments.Add(s);
+        }
+
+        return string.Join("/", safeSegments);
+    }
+
+    internal static bool ContainsInvalidSharePointChars(string path)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/');
+        return InvalidSharePointChars.IsMatch(normalized);
     }
 }

@@ -180,6 +180,46 @@ public class SharePointMigrationService
 
         _logger.LogInformation("Preparing SPMI migration package for {Count} files...", records.Count);
 
+        // Pre-validate and normalize mapped paths. Bad paths are skipped so one invalid item
+        // does not fail the full migration batch.
+        var validRecords = new List<FileRecord>(records.Count);
+        var skippedInvalidPath = 0;
+        foreach (var record in records)
+        {
+            try
+            {
+                var mappedPath = record.MappedPath.Replace('\\', '/').Trim('/');
+                if (string.IsNullOrWhiteSpace(mappedPath))
+                    throw new InvalidOperationException("Mapped path is empty.");
+
+                if (PathTransformService.ContainsInvalidSharePointChars(mappedPath))
+                    throw new InvalidOperationException($"Mapped path contains invalid SharePoint characters: {mappedPath}");
+
+                var safePath = PathTransformService.SanitizeSharePointRelativePath(mappedPath);
+                if (string.IsNullOrWhiteSpace(safePath))
+                    throw new InvalidOperationException("Mapped path became empty after sanitization.");
+
+                if (safePath.Length > 400)
+                    throw new InvalidOperationException($"Mapped path exceeds supported length: {safePath.Length}");
+
+                record.MappedPath = safePath;
+                validRecords.Add(record);
+            }
+            catch (Exception ex)
+            {
+                skippedInvalidPath++;
+                _logger.LogWarning("Skipping item due to invalid target path. Blob: {BlobPath}, MappedPath: {MappedPath}, Reason: {Reason}",
+                    record.BlobPath, record.MappedPath, ex.Message);
+            }
+        }
+
+        if (validRecords.Count == 0)
+            throw new InvalidOperationException("All files were skipped during path validation. No valid files to migrate.");
+
+        if (skippedInvalidPath > 0)
+            _logger.LogWarning("Skipped {SkippedCount} item(s) due to invalid/special-character paths. Continuing with {ValidCount} item(s).",
+                skippedInvalidPath, validRecords.Count);
+
         // Step 1: Provision SharePoint-managed migration containers + queue
         _logger.LogInformation("Provisioning SharePoint migration containers and queue...");
         var containersResult = _site.ProvisionMigrationContainers();
@@ -198,7 +238,7 @@ public class SharePointMigrationService
         _logger.LogInformation("Report queue provisioned.");
 
         // Step 2: Upload source files to the data container (AES-encrypted)
-        _logger.LogInformation("Uploading {Count} source files (encrypted) to SharePoint data container...", records.Count);
+        _logger.LogInformation("Uploading {Count} source files (encrypted) to SharePoint data container...", validRecords.Count);
 
         var dataContainer = new BlobContainerClient(new Uri(dataContainerUri));
         var uploadParallelism = Math.Max(1, _settings.UploadParallelism);
@@ -206,7 +246,7 @@ public class SharePointMigrationService
         var uploadedCount = 0;
 
         await Parallel.ForEachAsync(
-            records,
+            validRecords,
             new ParallelOptions { MaxDegreeOfParallelism = uploadParallelism },
             async (record, _) =>
             {
@@ -215,9 +255,9 @@ public class SharePointMigrationService
                 await UploadEncryptedBlobAsync(dataContainer, targetPath, stream);
 
                 var finished = Interlocked.Increment(ref uploadedCount);
-                if (finished % 100 == 0 || finished == records.Count)
+                if (finished % 100 == 0 || finished == validRecords.Count)
                 {
-                    _logger.LogInformation("Data upload progress: {Uploaded}/{Total}", finished, records.Count);
+                    _logger.LogInformation("Data upload progress: {Uploaded}/{Total}", finished, validRecords.Count);
                 }
             });
 
@@ -225,7 +265,7 @@ public class SharePointMigrationService
 
         // Step 3: Generate manifest XMLs
         var webUrl = _web.ServerRelativeUrl.TrimEnd('/');
-        var manifests = GenerateManifestPackage(records, _web.Id, webUrl);
+        var manifests = GenerateManifestPackage(validRecords, _web.Id, webUrl);
 
         // Step 4: Upload manifest XMLs to the metadata container (AES-encrypted)
         _logger.LogInformation("Uploading manifest package ({Count} encrypted XML files)...", manifests.Count);
@@ -267,7 +307,7 @@ public class SharePointMigrationService
             Status = "Queued",
             Progress = 0,
             CreatedDateTime = DateTime.UtcNow.ToString("O"),
-            TotalFileCount = records.Count
+            TotalFileCount = validRecords.Count
         };
     }
 
@@ -550,7 +590,10 @@ public class SharePointMigrationService
 
         foreach (var record in records)
         {
-            var targetPath = record.MappedPath.Replace('\\', '/').TrimStart('/');
+            // Ensure manifest paths are SharePoint-safe (special chars, trailing dots/spaces, etc.)
+            // This also prevents folder-create fatal errors like: Cannot create folder "... (ref: 123) ..."
+            var targetPath = PathTransformService.SanitizeSharePointRelativePath(
+                record.MappedPath.Replace('\\', '/').TrimStart('/'));
             var parts = targetPath.Split('/');
 
             // 3. Folder objects for all intermediate directories
@@ -594,6 +637,7 @@ public class SharePointMigrationService
                 : GenerateDeterministicGuid(fileParentPath).ToString();
 
             // FileValue = blob name in the data container (must match what we uploaded)
+            var metaInfo = BuildMetaInfoElement(ns, record.Metadata);
             root.Add(new XElement(ns + "SPObject",
                 new XAttribute("Id", fileId),
                 new XAttribute("ObjectType", "SPFile"),
@@ -614,10 +658,37 @@ public class SharePointMigrationService
                     new XAttribute("Version", "1.0"),
                     new XAttribute("FileValue", targetPath),
                     new XAttribute("Author", "1"),
-                    new XAttribute("ModifiedBy", "1"))));
+                    new XAttribute("ModifiedBy", "1"),
+                    metaInfo)));
         }
 
         return XmlToString(new XDocument(new XDeclaration("1.0", "utf-8", null), root));
+    }
+
+    private static XElement BuildMetaInfoElement(XNamespace ns, IDictionary<string, string>? metadata)
+    {
+        // SPMI import supports MetaInfo properties in the manifest.
+        // We include blob metadata as best-effort name/value pairs.
+        var meta = new XElement(ns + "MetaInfo");
+
+        if (metadata == null || metadata.Count == 0)
+            return meta;
+
+        foreach (var kvp in metadata)
+        {
+            var name = (kvp.Key ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            // Keep values non-null; SharePoint import is picky about invalid XML chars.
+            var value = kvp.Value ?? string.Empty;
+
+            meta.Add(new XElement(ns + "Property",
+                new XAttribute("Name", name),
+                value));
+        }
+
+        return meta;
     }
 
     private string GenerateRequirements()
