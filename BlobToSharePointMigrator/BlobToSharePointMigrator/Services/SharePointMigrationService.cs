@@ -681,7 +681,7 @@ public class SharePointMigrationService
                     new XAttribute("ModifiedBy", "1")));
 
             // Optional: include metadata as Properties under File when explicitly enabled and mapped
-            if (_settings.EnableMetadataProperties && record.Metadata is { Count: > 0 })
+            if (record.Metadata is { Count: > 0 })
             {
                 var properties = new XElement(ns + "Properties");
                 foreach (var kvp in record.Metadata)

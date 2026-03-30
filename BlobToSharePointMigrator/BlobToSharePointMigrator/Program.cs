@@ -68,6 +68,16 @@ try
     logger.LogInformation("STEP 1/5 - Inventorying Azure Blob Storage...");
     var records = await blobService.InventoryAsync();
 
+    // Optional source prefilter: BlobFolderPrefix
+    if (!string.IsNullOrWhiteSpace(migrationSettings.BlobFolderPrefix))
+    {
+        var prefix = migrationSettings.BlobFolderPrefix.Replace('\\', '/');
+        var before = records.Count;
+        records = records.Where(r => (r.BlobPath ?? string.Empty).Replace('\\', '/').StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList();
+        logger.LogInformation("Applied BlobFolderPrefix filter: kept {Kept} of {Before} records under '{Prefix}'",
+            records.Count, before, migrationSettings.BlobFolderPrefix);
+    }
+
     logger.LogInformation("STEP 2/5 - Transforming folder paths...");
     transformSvc.TransformAll(records);
 
@@ -78,6 +88,21 @@ try
         logger.LogInformation("Skipped: {File} ({Reason})", s.BlobPath, s.SkipReason);
 
     var toMigrate = allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
+
+    // Optional year filter on mapped destination (YYYY/CaseNumber/...)
+    if (migrationSettings.MigrationYear > 0 && migrationSettings.UseYyyyCaseNumberPath)
+    {
+        var yearStr = migrationSettings.MigrationYear.ToString();
+        var before = toMigrate.Count;
+        toMigrate = toMigrate.Where(r =>
+        {
+            var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+            var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            return segs.Length > 0 && string.Equals(segs[0], yearStr, StringComparison.OrdinalIgnoreCase);
+        }).ToList();
+        logger.LogInformation("Applied MigrationYear filter: kept {Kept} of {Before} files for year {Year}",
+            toMigrate.Count, before, migrationSettings.MigrationYear);
+    }
     if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
     {
         toMigrate = toMigrate.Take(migrationSettings.MaxFilesToMigrate).ToList();
@@ -181,8 +206,21 @@ try
             {
                 try
                 {
-                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files...",
-                        index + 1, batchesToRun.Count, batch.Count);
+                    // Try to extract a single case folder id (YYYY/CaseNumber) for nicer progress logs
+                    string caseLabel = "";
+                    var cases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var r in batch)
+                    {
+                        var p = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+                        var seg = p.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                        if (seg.Length >= 2 && Regex.IsMatch(seg[0], "^\\d{4}$") && Regex.IsMatch(seg[1], "^\\d+$"))
+                            cases.Add($"{seg[0]}/{seg[1]}");
+                        if (cases.Count > 2) break;
+                    }
+                    caseLabel = cases.Count == 1 ? cases.First() : (cases.Count > 1 ? $"{cases.Count} cases" : "mixed");
+
+                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case}",
+                        index + 1, batchesToRun.Count, batch.Count, caseLabel);
                     var jobInfo = await spService.SubmitMigrationJobAsync(batch, blobService.DownloadBlobAsync);
                     logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
