@@ -189,6 +189,8 @@ try
     logger.LogInformation("Submitting {BatchCount} migration job(s) ({Total} files total)...", batchesToRun.Count, toMigrate.Count);
 
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
+    var aggregateAlreadyExists = 0;
+    var aggregateOtherErrors = 0;
 
     // Run with limited parallelism based on config
     var parallelJobs = Math.Max(1, migrationSettings.MaxParallelJobs);
@@ -228,6 +230,8 @@ try
                         jobInfo.JobId,
                         TimeSpan.FromMinutes(timeoutMinutes),
                         pollIntervalSeconds * 1000);
+                    Interlocked.Add(ref aggregateAlreadyExists, finalJobInfo.AlreadyExistsCount);
+                    Interlocked.Add(ref aggregateOtherErrors, finalJobInfo.OtherErrorCount);
 
                     var markAllFailed = finalJobInfo.Status == "Failed" ||
                                         (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
@@ -314,10 +318,12 @@ try
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
-    reportSvc.PrintSummary(allResults, skipped);
+    reportSvc.PrintSummary(allResults, skipped, aggregateAlreadyExists);
 
     logger.LogInformation(string.Empty);
     logger.LogInformation("Migration complete! Submitted jobs: {Jobs}, Total files: {Total}", batchesToRun.Count, toMigrate.Count);
+    logger.LogInformation("Conflict summary: AlreadyExists={AlreadyExists}, OtherErrors={OtherErrors}",
+        aggregateAlreadyExists, aggregateOtherErrors);
 }
 catch (Exception ex)
 {

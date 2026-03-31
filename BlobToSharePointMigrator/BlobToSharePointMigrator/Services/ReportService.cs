@@ -57,7 +57,7 @@ public class ReportService
         _logger.LogInformation("Report saved: {File}", _settings.ReportFile);
     }
 
-    public void PrintSummary(List<MigrationResult> results, List<FileRecord> skipped)
+    public void PrintSummary(List<MigrationResult> results, List<FileRecord> skipped, int alreadyExistsConflicts = 0)
     {
         var success  = results.Count(r => r.Status == "Success");
         var partial  = results.Count(r => r.Status == "PartialSuccess");
@@ -71,6 +71,7 @@ public class ReportService
         Console.WriteLine($"   Partial    : {partial}");
         Console.WriteLine($"   Failed     : {failed}");
         Console.WriteLine($"   Skipped    : {skipped.Count}");
+        Console.WriteLine($"   Exists     : {alreadyExistsConflicts}");
         Console.WriteLine($"   Report     : {_settings.ReportFile}");
         Console.WriteLine("===================================================");
         Console.WriteLine();

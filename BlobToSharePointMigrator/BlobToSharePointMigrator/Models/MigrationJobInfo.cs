@@ -10,5 +10,7 @@ public class MigrationJobInfo
     public int TotalFileCount { get; set; }
     public int ProcessedFileCount { get; set; }
     public int FailedFileCount { get; set; }
+    public int AlreadyExistsCount { get; set; }
+    public int OtherErrorCount { get; set; }
     public List<string> Errors { get; set; } = new();
 }

@@ -420,6 +420,8 @@ public class SharePointMigrationService
                         CreatedDateTime = DateTime.UtcNow.ToString("O"),
                         ProcessedFileCount = queueSummary.FilesCreated,
                         FailedFileCount = queueSummary.TotalErrors,
+                        AlreadyExistsCount = queueSummary.AlreadyExistsCount,
+                        OtherErrorCount = queueSummary.OtherErrorCount,
                         Errors = queueSummary.Errors
                     };
                 }
@@ -508,8 +510,19 @@ public class SharePointMigrationService
                     || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (message.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+                        summary.AlreadyExistsCount++;
+                    else if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase))
+                        summary.OtherErrorCount++;
+
                     summary.Errors.Add($"[{eventType}] {message}");
                     _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, message);
+                }
+
+                if (eventType.Contains("JobProgress", StringComparison.OrdinalIgnoreCase))
+                {
+                    summary.FilesCreated = Math.Max(summary.FilesCreated, ParseInt(json["FilesCreated"]?.ToString()));
+                    summary.TotalErrors = Math.Max(summary.TotalErrors, ParseInt(json["TotalErrors"]?.ToString()));
                 }
 
                 if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))
@@ -526,7 +539,7 @@ public class SharePointMigrationService
 
         if (summary.SawFinalEvent)
         {
-            if (summary.SawFatalError || summary.FilesCreated == 0)
+            if (summary.SawFatalError)
                 summary.Status = "Failed";
             else if (summary.Errors.Count > 0 || summary.TotalErrors > 0)
                 summary.Status = "CompletedWithErrors";
@@ -545,6 +558,8 @@ public class SharePointMigrationService
         public bool SawFatalError { get; set; }
         public int FilesCreated { get; set; }
         public int TotalErrors { get; set; }
+        public int AlreadyExistsCount { get; set; }
+        public int OtherErrorCount { get; set; }
     }
 
     private static int ParseInt(string? value)
