@@ -22,6 +22,7 @@ public class MigrationSettings
     public int MaxFilesToMigrate            { get; set; } = 0;
     public int JobPollIntervalSeconds       { get; set; } = 10;
     public int JobTimeoutMinutes            { get; set; } = 60;
+    public int CsomRequestTimeoutSeconds    { get; set; } = 600;
     public bool UseYyyyCaseNumberPath       { get; set; } = true;
     public int MaxParallelJobs              { get; set; } = 3;
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName

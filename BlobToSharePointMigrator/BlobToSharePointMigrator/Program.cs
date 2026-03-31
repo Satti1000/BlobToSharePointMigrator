@@ -274,6 +274,32 @@ try
                     logger.LogInformation("Job {Index}/{TotalJobs} complete: Status={Status}, Processed={Processed}/{Total}",
                         index + 1, batchesToRun.Count, finalJobInfo.Status, finalJobInfo.ProcessedFileCount, finalJobInfo.TotalFileCount);
                 }
+                catch (Exception ex)
+                {
+                    // Do not fail the full pipeline when a single batch fails; continue other batches.
+                    logger.LogError(ex, "Job {Index}/{TotalJobs} failed. Continuing with remaining batches.",
+                        index + 1, batchesToRun.Count);
+
+                    foreach (var record in batch)
+                    {
+                        var failed = new BlobToSharePointMigrator.Models.MigrationResult
+                        {
+                            SourceFile = record.BlobPath,
+                            DestPath = record.MappedPath,
+                            SizeBytes = record.SizeBytes,
+                            LastModified = record.LastModified,
+                            Status = "Failed",
+                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{migrationSettings.SharePointDocumentLibrary}/{record.MappedPath}",
+                            Error = ex.Message,
+                            Duration = "N/A (batch operation)"
+                        };
+
+                        lock (allResults)
+                        {
+                            allResults.Add(failed);
+                        }
+                    }
+                }
                 finally
                 {
                     gate.Release();

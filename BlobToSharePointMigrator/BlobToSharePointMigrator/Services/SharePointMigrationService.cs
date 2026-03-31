@@ -10,6 +10,7 @@ using Microsoft.SharePoint.Client;
 using PnP.Framework;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
 
@@ -77,20 +78,21 @@ public class SharePointMigrationService
             _logger.LogInformation("Connecting to SharePoint (PnP.Framework CSOM app-only): {Url}", siteUrl);
 
             var certificate = LoadCertificate(_settings);
-            var authManager = new AuthenticationManager(
+            var authManager = new PnP.Framework.AuthenticationManager(
                 _settings.SharePointClientId,
                 certificate,
                 _settings.SharePointTenantId);
 
             // IMPORTANT: do NOT wrap this in a using; we need it for the rest of the pipeline.
             _clientContextG = await authManager.GetContextAsync(siteUrl).ConfigureAwait(false);
+            _clientContextG.RequestTimeout = Math.Max(60, _settings.CsomRequestTimeoutSeconds) * 1000;
 
             // Load site, web, and target document library metadata
             _site = _clientContextG.Site;
             _web = _clientContextG.Web;
             _clientContextG.Load(_site, s => s.Id, s => s.Url);
             _clientContextG.Load(_web, w => w.Id, w => w.Title, w => w.ServerRelativeUrl);
-            await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
 
             _siteId = _site.Id.ToString();
             _webId = _web.Id.ToString();
@@ -101,7 +103,7 @@ public class SharePointMigrationService
             var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
             _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
             _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-            await _clientContextG.ExecuteQueryAsync().ConfigureAwait(false);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
 
             _listId = list.Id.ToString();
             _rootFolderId = list.RootFolder.UniqueId.ToString();
@@ -234,7 +236,7 @@ public class SharePointMigrationService
             {
                 var containersResult = _site.ProvisionMigrationContainers();
                 var queueResult = _site.ProvisionMigrationQueue();
-                await _clientContextG.ExecuteQueryAsync();
+                await ExecuteQueryWithRetryAsync();
 
                 var containers = containersResult?.Value;
                 dataContainerUri = containers?.DataContainerUri;
@@ -334,7 +336,7 @@ public class SharePointMigrationService
             queueUri,
             encryptionOption);
 
-        await _clientContextG.ExecuteQueryAsync();
+        await ExecuteQueryWithRetryAsync();
 
         var jobId = jobIdResult.Value;
         _logger.LogInformation("Migration job submitted: {JobId}", jobId);
@@ -374,7 +376,7 @@ public class SharePointMigrationService
             try
             {
                 statusResult = _site.GetMigrationJobStatus(jobId);
-                await _clientContextG.ExecuteQueryAsync();
+                await ExecuteQueryWithRetryAsync();
             }
             catch (Exception ex) when (IsTransientRequestError(ex))
             {
@@ -554,12 +556,41 @@ public class SharePointMigrationService
     {
         if (ex is HttpRequestException || ex is TaskCanceledException)
             return true;
+        if (ex is WebException wex &&
+            (wex.Status == WebExceptionStatus.Timeout ||
+             wex.Status == WebExceptionStatus.ConnectFailure ||
+             wex.Status == WebExceptionStatus.NameResolutionFailure ||
+             wex.Status == WebExceptionStatus.ConnectionClosed))
+            return true;
 
         if (ex is Microsoft.SharePoint.Client.ClientRequestException crex &&
             crex.Message.Contains("while sending the request", StringComparison.OrdinalIgnoreCase))
             return true;
 
         return ex.InnerException is HttpRequestException;
+    }
+
+    private async Task ExecuteQueryWithRetryAsync(int maxAttempts = 4)
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                await _clientContextG.ExecuteQueryAsync();
+                return;
+            }
+            catch (Exception ex) when (IsTransientRequestError(ex) && attempt < maxAttempts)
+            {
+                var delay = TimeSpan.FromSeconds(Math.Min(20, Math.Pow(2, attempt)));
+                _logger.LogWarning(ex,
+                    "Transient CSOM timeout/request error (attempt {Attempt}/{MaxAttempts}); retrying in {Delay}s...",
+                    attempt, maxAttempts, delay.TotalSeconds);
+                await Task.Delay(delay);
+            }
+        }
+
+        // final attempt propagates original exception for caller handling
+        await _clientContextG.ExecuteQueryAsync();
     }
 
     /// <summary>
