@@ -484,7 +484,7 @@ public class SharePointMigrationService
             {
                 var outerBody = msg.Body.ToString();
                 var decrypted = DecryptQueueMessage(outerBody);
-                _logger.LogInformation("Queue report: {Message}", decrypted);
+                _logger.LogDebug("Queue report raw: {Message}", decrypted);
 
                 var json = Newtonsoft.Json.Linq.JObject.Parse(decrypted);
                 var eventType = json["Event"]?.ToString() ?? "";
@@ -529,6 +529,11 @@ public class SharePointMigrationService
                 {
                     summary.FilesCreated = Math.Max(summary.FilesCreated, ParseInt(json["FilesCreated"]?.ToString()));
                     summary.TotalErrors = Math.Max(summary.TotalErrors, ParseInt(json["TotalErrors"]?.ToString()));
+                    var totalWarnings = ParseInt(json["TotalWarnings"]?.ToString());
+                    var objectsProcessed = ParseInt(json["ObjectsProcessed"]?.ToString());
+                    _logger.LogInformation(
+                        "Queue progress: created={FilesCreated}, objects={ObjectsProcessed}, errors={Errors}, warnings={Warnings}",
+                        summary.FilesCreated, objectsProcessed, summary.TotalErrors, totalWarnings);
                 }
 
                 if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))

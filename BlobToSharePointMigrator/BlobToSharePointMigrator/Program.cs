@@ -218,9 +218,10 @@ try
                         if (cases.Count > 2) break;
                     }
                     caseLabel = cases.Count == 1 ? cases.First() : (cases.Count > 1 ? $"{cases.Count} cases" : "mixed");
+                    var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
 
-                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case}",
-                        index + 1, batchesToRun.Count, batch.Count, caseLabel);
+                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — sample file: {File}",
+                        index + 1, batchesToRun.Count, batch.Count, caseLabel, sampleFile);
                     var jobInfo = await spService.SubmitMigrationJobAsync(batch, blobService.DownloadBlobAsync);
                     logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
