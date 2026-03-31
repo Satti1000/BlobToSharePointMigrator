@@ -271,15 +271,20 @@ public class SharePointMigrationService
         if (!provisioned)
             throw new InvalidOperationException("Failed to provision SharePoint migration containers/queue. Verify site permissions and try again.");
 
-        _logger.LogInformation("Data container provisioned: {Uri}", dataContainerUri.Split('?')[0]);
-        _logger.LogInformation("Metadata container provisioned: {Uri}", metadataContainerUri.Split('?')[0]);
-        _queueUri = queueUri;
+        // By this point values are validated; use non-null locals for downstream usage.
+        var dataContainerUriValue = dataContainerUri!;
+        var metadataContainerUriValue = metadataContainerUri!;
+        var queueUriValue = queueUri!;
+
+        _logger.LogInformation("Data container provisioned: {Uri}", dataContainerUriValue.Split('?')[0]);
+        _logger.LogInformation("Metadata container provisioned: {Uri}", metadataContainerUriValue.Split('?')[0]);
+        _queueUri = queueUriValue;
         _logger.LogInformation("Report queue provisioned.");
 
         // Step 2: Upload source files to the data container (AES-encrypted)
         _logger.LogInformation("Uploading {Count} source files (encrypted) to SharePoint data container...", validRecords.Count);
 
-        var dataContainer = new BlobContainerClient(new Uri(dataContainerUri));
+        var dataContainer = new BlobContainerClient(new Uri(dataContainerUriValue));
         var uploadParallelism = Math.Max(1, _settings.UploadParallelism);
         _logger.LogInformation("Data upload parallelism: {Parallelism}", uploadParallelism);
         var uploadedCount = 0;
@@ -319,7 +324,7 @@ public class SharePointMigrationService
         // Step 4: Upload manifest XMLs to the metadata container (AES-encrypted)
         _logger.LogInformation("Uploading manifest package ({Count} encrypted XML files)...", manifests.Count);
 
-        var metadataContainer = new BlobContainerClient(new Uri(metadataContainerUri));
+        var metadataContainer = new BlobContainerClient(new Uri(metadataContainerUriValue));
 
         foreach (var (fileName, content) in manifests)
         {
@@ -337,9 +342,9 @@ public class SharePointMigrationService
 
         var jobIdResult = _site.CreateMigrationJobEncrypted(
             _web.Id,
-            dataContainerUri,
-            metadataContainerUri,
-            queueUri,
+            dataContainerUriValue,
+            metadataContainerUriValue,
+            queueUriValue,
             encryptionOption);
 
         await ExecuteQueryWithRetryAsync();
