@@ -107,6 +107,15 @@ try
         logger.LogInformation("Milestone cap active: limiting run to first {Limit} files.", migrationSettings.MaxFilesToMigrate);
     }
 
+    if (migrationSettings.RetryFailedOnly)
+    {
+        var failedSet = reportSvc.LoadFailedSourceFiles();
+        var before = toMigrate.Count;
+        toMigrate = toMigrate.Where(r => failedSet.Contains(r.BlobPath)).ToList();
+        logger.LogInformation("RetryFailedOnly enabled: kept {Kept} of {Before} files from {FailedItemsFile}.",
+            toMigrate.Count, before, migrationSettings.FailedItemsFile);
+    }
+
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
@@ -319,6 +328,7 @@ try
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
+    reportSvc.WriteFailedItems(allResults);
     reportSvc.PrintSummary(allResults, skipped, aggregateAlreadyExists);
 
     logger.LogInformation(string.Empty);

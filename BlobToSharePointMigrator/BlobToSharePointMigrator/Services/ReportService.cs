@@ -57,6 +57,44 @@ public class ReportService
         _logger.LogInformation("Report saved: {File}", _settings.ReportFile);
     }
 
+    public void WriteFailedItems(List<MigrationResult> results)
+    {
+        var failed = results
+            .Where(r => r.Status == "Failed")
+            .Where(r => _settings.RetryIncludeAlreadyExists ||
+                        !r.Error.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+            .Select(r => new FailedItemRow
+            {
+                SourceFile = r.SourceFile,
+                DestPath = r.DestPath,
+                Error = r.Error
+            })
+            .ToList();
+
+        using var writer = new StreamWriter(_settings.FailedItemsFile);
+        using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
+        csv.WriteRecords(failed);
+        _logger.LogInformation("Failed-items file saved: {File} ({Count} rows)",
+            _settings.FailedItemsFile, failed.Count);
+    }
+
+    public HashSet<string> LoadFailedSourceFiles()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(_settings.FailedItemsFile))
+            return set;
+
+        using var reader = new StreamReader(_settings.FailedItemsFile);
+        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+        var rows = csv.GetRecords<FailedItemRow>();
+        foreach (var row in rows)
+        {
+            if (!string.IsNullOrWhiteSpace(row.SourceFile))
+                set.Add(row.SourceFile);
+        }
+        return set;
+    }
+
     public void PrintSummary(List<MigrationResult> results, List<FileRecord> skipped, int alreadyExistsConflicts = 0)
     {
         var success  = results.Count(r => r.Status == "Success");
@@ -91,5 +129,12 @@ public class ReportService
             foreach (var r in results.Where(r => r.Status == "Failed"))
                 Console.WriteLine($"  - {r.SourceFile}: {r.Error}");
         }
+    }
+
+    private sealed class FailedItemRow
+    {
+        public string SourceFile { get; set; } = string.Empty;
+        public string DestPath { get; set; } = string.Empty;
+        public string Error { get; set; } = string.Empty;
     }
 }

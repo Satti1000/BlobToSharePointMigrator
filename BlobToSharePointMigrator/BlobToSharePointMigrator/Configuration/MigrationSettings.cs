@@ -28,4 +28,7 @@ public class MigrationSettings
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName
     public string BlobFolderPrefix          { get; set; } = string.Empty; // optional source filter
     public int MigrationYear                { get; set; } = 0;            // 0 = all years
+    public string FailedItemsFile           { get; set; } = "failed-files.csv";
+    public bool RetryFailedOnly             { get; set; } = false;
+    public bool RetryIncludeAlreadyExists   { get; set; } = false;
 }
