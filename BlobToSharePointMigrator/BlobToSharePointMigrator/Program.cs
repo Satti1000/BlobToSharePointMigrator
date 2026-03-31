@@ -54,7 +54,7 @@ var transformSvc = new PathTransformService(
     Path.Combine(AppContext.BaseDirectory, migrationSettings.MappingFile),
     migrationSettings.UseYyyyCaseNumberPath,
     loggerFactory.CreateLogger<PathTransformService>());
-var spService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
@@ -147,7 +147,7 @@ try
     }
 
     logger.LogInformation("STEP 3/5 - Connecting to SharePoint...");
-    await spService.ConnectAsync();
+    await spServiceProbe.ConnectAsync();
 
     // STEP 4/5 and 5/5 — optionally partition into multiple jobs to improve SharePoint-side throughput.
     // Simple heuristic: when using YYYY/CaseNumber mapping and file count is large, batch by case folder,
@@ -200,6 +200,7 @@ try
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var aggregateAlreadyExists = 0;
     var aggregateOtherErrors = 0;
+    var deltaLock = new object();
 
     // Run with limited parallelism based on config
     var parallelJobs = Math.Max(1, migrationSettings.MaxParallelJobs);
@@ -231,15 +232,19 @@ try
 
                     logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — sample file: {File}",
                         index + 1, batchesToRun.Count, batch.Count, caseLabel, sampleFile);
-                    var jobInfo = await spService.SubmitMigrationJobAsync(batch, blobService.DownloadBlobAsync);
+                    // Use isolated service/context per concurrent batch to avoid shared-state contention.
+                    var batchSpService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+                    await batchSpService.ConnectAsync();
+                    var jobInfo = await batchSpService.SubmitMigrationJobAsync(batch, blobService.DownloadBlobAsync);
                     logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
                     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
                     var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
-                    var finalJobInfo = await spService.PollMigrationJobAsync(
+                    var finalJobInfo = await batchSpService.PollMigrationJobAsync(
                         jobInfo.JobId,
                         TimeSpan.FromMinutes(timeoutMinutes),
                         pollIntervalSeconds * 1000);
+                    await batchSpService.CleanupStagingContainersAsync();
                     Interlocked.Add(ref aggregateAlreadyExists, finalJobInfo.AlreadyExistsCount);
                     Interlocked.Add(ref aggregateOtherErrors, finalJobInfo.OtherErrorCount);
 
@@ -282,7 +287,12 @@ try
                         }
 
                         if (result.Status == "Success" || result.Status == "PartialSuccess")
-                            reportSvc.TrackMigrated(record);
+                        {
+                            lock (deltaLock)
+                            {
+                                reportSvc.TrackMigrated(record);
+                            }
+                        }
                     }
 
                     logger.LogInformation("Job {Index}/{TotalJobs} complete: Status={Status}, Processed={Processed}/{Total}",
@@ -323,8 +333,6 @@ try
 
         await Task.WhenAll(tasks);
     }
-
-    await spService.CleanupStagingContainersAsync();
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
