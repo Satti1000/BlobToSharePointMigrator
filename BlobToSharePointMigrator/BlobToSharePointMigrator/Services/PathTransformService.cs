@@ -184,6 +184,60 @@ public class PathTransformService
         return string.Join("/", safeSegments);
     }
 
+    internal static string TruncateSharePointRelativePath(string path, int maxTotalLength = 400)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+        if (normalized.Length <= maxTotalLength)
+            return normalized;
+
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries).ToArray();
+        if (segments.Length == 0)
+            return normalized;
+
+        // Preserve extension on final segment while truncating.
+        var fileName = segments[^1];
+        var ext = Path.GetExtension(fileName);
+        var baseName = fileName[..Math.Max(0, fileName.Length - ext.Length)];
+        var hash = Math.Abs(StringComparer.OrdinalIgnoreCase.GetHashCode(normalized)).ToString("X");
+
+        // First pass: cap each non-final segment more aggressively.
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            if (segments[i].Length > 64)
+                segments[i] = segments[i][..64];
+        }
+
+        // Build compact final file segment.
+        var maxFileBase = Math.Max(16, 120 - (ext.Length + hash.Length + 1));
+        if (baseName.Length > maxFileBase)
+            baseName = baseName[..maxFileBase];
+        segments[^1] = $"{baseName}-{hash}{ext}";
+
+        var candidate = string.Join("/", segments);
+        if (candidate.Length <= maxTotalLength)
+            return candidate;
+
+        // Second pass: trim path segments from the right (excluding first two: YYYY/case when present).
+        for (var i = segments.Length - 2; i >= 0 && candidate.Length > maxTotalLength; i--)
+        {
+            var floor = i <= 1 ? 8 : 3; // keep higher fidelity for year/case
+            if (segments[i].Length > floor)
+            {
+                var cutBy = Math.Min(segments[i].Length - floor, candidate.Length - maxTotalLength);
+                segments[i] = segments[i][..(segments[i].Length - cutBy)];
+                candidate = string.Join("/", segments);
+            }
+        }
+
+        // Last-resort hard cut (still keeps end of filename hash/ext).
+        if (candidate.Length > maxTotalLength)
+            candidate = candidate[..maxTotalLength].Trim('/');
+
+        return candidate;
+    }
+
     internal static bool ContainsInvalidSharePointChars(string path)
     {
         var normalized = (path ?? string.Empty).Replace('\\', '/').Trim('/');

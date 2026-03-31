@@ -202,7 +202,13 @@ public class SharePointMigrationService
                     throw new InvalidOperationException("Mapped path became empty after sanitization.");
 
                 if (safePath.Length > 400)
-                    throw new InvalidOperationException($"Mapped path exceeds supported length: {safePath.Length}");
+                {
+                    var originalLength = safePath.Length;
+                    safePath = PathTransformService.TruncateSharePointRelativePath(safePath, 400);
+                    _logger.LogInformation(
+                        "Truncated long mapped path from {OriginalLength} to {NewLength} chars for blob {BlobPath}.",
+                        originalLength, safePath.Length, record.BlobPath);
+                }
 
                 record.MappedPath = safePath;
                 validRecords.Add(record);
