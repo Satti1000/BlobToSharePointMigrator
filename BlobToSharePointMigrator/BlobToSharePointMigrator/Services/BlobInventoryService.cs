@@ -129,6 +129,10 @@ public class BlobInventoryService
 
     private static async Task<List<string>> BuildTargetPrefixesAsync(BlobContainerClient containerClient, string basePrefix)
     {
+        var normalizedBasePrefix = string.IsNullOrWhiteSpace(basePrefix)
+            ? string.Empty
+            : basePrefix.Trim('/') + "/";
+
         var yearFolders = await GetDirectSubfoldersAsync(containerClient, basePrefix);
         var years = yearFolders
             .Where(y => Regex.IsMatch(y, @"^\d{4}$"))
@@ -143,9 +147,42 @@ public class BlobInventoryService
             for (int month = 1; month <= 12; month++)
             {
                 var monthToken = $"M{month:00}";
-                var yearMonthPrefix = $"{basePrefix}{year}/{monthToken}/";
+                var yearMonthPrefix = $"{normalizedBasePrefix}{year}/{monthToken}/";
                 foreach (var family in caseFamilies)
                     prefixes.Add($"{yearMonthPrefix}{family}");
+            }
+        }
+
+        // Fallback modes for already-scoped basePrefix, e.g. ".../2014/" or ".../2014/M03/".
+        if (prefixes.Count == 0 && !string.IsNullOrWhiteSpace(normalizedBasePrefix))
+        {
+            var segments = normalizedBasePrefix.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length > 0)
+            {
+                var last = segments[^1];
+
+                // If already pointing at a family prefix path, use it directly.
+                if (caseFamilies.Any(f => last.StartsWith(f, StringComparison.OrdinalIgnoreCase)))
+                {
+                    prefixes.Add(normalizedBasePrefix);
+                }
+                // If already on month scope, append family prefixes.
+                else if (Regex.IsMatch(last, @"^M\d{2}$", RegexOptions.IgnoreCase))
+                {
+                    foreach (var family in caseFamilies)
+                        prefixes.Add($"{normalizedBasePrefix}{family}");
+                }
+                // If on year scope, generate all months + families.
+                else if (Regex.IsMatch(last, @"^\d{4}$"))
+                {
+                    for (int month = 1; month <= 12; month++)
+                    {
+                        var monthToken = $"M{month:00}";
+                        var yearMonthPrefix = $"{normalizedBasePrefix}{monthToken}/";
+                        foreach (var family in caseFamilies)
+                            prefixes.Add($"{yearMonthPrefix}{family}");
+                    }
+                }
             }
         }
 
