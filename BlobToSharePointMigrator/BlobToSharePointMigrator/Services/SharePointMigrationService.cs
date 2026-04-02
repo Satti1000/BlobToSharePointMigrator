@@ -103,41 +103,37 @@ public class SharePointMigrationService
 
             _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}, Title: {Title}", _siteId, _webId, _web.Title);
 
-            // Resolve the target document library
-            var documentLibraryTitle = (_settings.SharePointDocumentLibrary ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(documentLibraryTitle))
-            {
-                throw new InvalidOperationException(
-                    "Migration:SharePointDocumentLibrary is empty. Set it to the exact SharePoint library title (for example: 'Documents' or 'Shared Documents').");
-            }
+            // Do NOT resolve a specific library here; that will be done per job,
+            // enabling Year-as-Library mode.
+            _logger.LogInformation("Connected to site/web. Library will be resolved per job.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error connecting to SharePoint");
+            throw;
+        }
 
-            List list;
-            try
-            {
-                list = _web.Lists.GetByTitle(documentLibraryTitle);
-                _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
-                _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-                await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
-            }
-            catch (ServerException ex) when (
-                ex.Message.Contains("title", StringComparison.OrdinalIgnoreCase) &&
-                ex.Message.Contains("invalid", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    $"Invalid Migration:SharePointDocumentLibrary value '{documentLibraryTitle}'. Use the exact library title from SharePoint Library Settings (for example: 'Documents' or 'Shared Documents').",
-                    ex);
-            }
+    }
+
+    private async Task ResolveTargetLibraryAsync(string libraryTitle)
+    {
+        var documentLibraryTitle = (libraryTitle ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(documentLibraryTitle))
+        {
+            throw new InvalidOperationException(
+                "Target library title is empty. Provide a valid SharePoint document library title.");
+        }
+
+        try
+        {
+            var list = _web.Lists.GetByTitle(documentLibraryTitle);
+            _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
+            _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
 
             _listId = list.Id.ToString();
             _rootFolderId = list.RootFolder.UniqueId.ToString();
 
-            // Normalize to web-relative library root for SPMI manifest URLs.
-            // Example:
-            //   list.RootFolder.ServerRelativeUrl = "sites/sharepointmigration/Shared Documents"
-            //   _web.ServerRelativeUrl            = "sites/sharepointmigration"
-            //   _rootFolderUrl                    = "Shared Documents"
-            // Without this, SharePoint import can duplicate site path and fail:
-            //   ".../sites/sharepointmigration/sites/sharepointmigration/Shared Documents/General"
             var listRootServerRelative = list.RootFolder.ServerRelativeUrl.Trim('/');
             var webServerRelative = _web.ServerRelativeUrl.Trim('/');
             if (!string.IsNullOrWhiteSpace(webServerRelative) &&
@@ -150,15 +146,17 @@ public class SharePointMigrationService
                 _rootFolderUrl = listRootServerRelative;
             }
 
-            _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
+            _logger.LogInformation("Resolved target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
                 documentLibraryTitle, _listId, _rootFolderUrl);
         }
-        catch (Exception ex)
+        catch (ServerException ex) when (
+            ex.Message.Contains("title", StringComparison.OrdinalIgnoreCase) &&
+            ex.Message.Contains("invalid", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogError(ex, "Error resolving target library '{Library}'", _settings.SharePointDocumentLibrary);
-            throw;
+            throw new InvalidOperationException(
+                $"Invalid library title '{documentLibraryTitle}'. Use the exact library title from SharePoint Library Settings (for example: 'Documents', 'Shared Documents', or '2014').",
+                ex);
         }
-
     }
 
     private static X509Certificate2 LoadCertificate(MigrationSettings settings)
@@ -198,12 +196,17 @@ public class SharePointMigrationService
     /// </summary>
     public async Task<MigrationJobInfo> SubmitMigrationJobAsync(
         List<FileRecord> records,
-        Func<string, Task<Stream>> blobDownloader)
+        Func<string, Task<Stream>> blobDownloader,
+        string? libraryTitleOverride = null)
     {
         if (records.Count == 0)
             throw new ArgumentException("No files to migrate");
 
         _logger.LogInformation("Preparing SPMI migration package for {Count} files...", records.Count);
+
+        // Resolve the target library for this job
+        var targetLibraryTitle = (libraryTitleOverride ?? _settings.SharePointDocumentLibrary)?.Trim() ?? string.Empty;
+        await ResolveTargetLibraryAsync(targetLibraryTitle);
 
         // Pre-validate and normalize mapped paths. Bad paths are skipped so one invalid item
         // does not fail the full migration batch.

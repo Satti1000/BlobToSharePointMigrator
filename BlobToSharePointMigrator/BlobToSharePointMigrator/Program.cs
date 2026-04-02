@@ -71,7 +71,7 @@ static void ValidateStartupSettings(MigrationSettings migrationSettings)
         errors.Add("Migration:SourceContainer is empty.");
     if (string.IsNullOrWhiteSpace(migrationSettings.SharePointSiteUrl))
         errors.Add("Migration:SharePointSiteUrl is empty.");
-    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
+    if (!migrationSettings.YearAsLibrary && string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
         errors.Add("Migration:SharePointDocumentLibrary is empty (use exact library title like 'Documents' or 'Shared Documents').");
     if (string.IsNullOrWhiteSpace(migrationSettings.SharePointClientId))
         errors.Add("Migration:SharePointClientId is empty.");
@@ -268,12 +268,43 @@ try
                     caseLabel = cases.Count == 1 ? cases.First() : (cases.Count > 1 ? $"{cases.Count} cases" : "mixed");
                     var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
 
-                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — sample file: {File}",
-                        index + 1, batchesToRun.Count, batch.Count, caseLabel, sampleFile);
+                    // Determine target library for this batch
+                    string targetLibrary = migrationSettings.YearAsLibrary
+                        ? ((batch.Select(b => (b.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
+                            .FirstOrDefault())?.Trim() ?? string.Empty)
+                        : migrationSettings.SharePointDocumentLibrary;
+
+                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — sample file: {File} — library: {Library}",
+                        index + 1, batchesToRun.Count, batch.Count, caseLabel, sampleFile, targetLibrary);
                     // Use isolated service/context per concurrent batch to avoid shared-state contention.
                     var batchSpService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
                     await batchSpService.ConnectAsync();
-                    var jobInfo = await batchSpService.SubmitMigrationJobAsync(batch, blobService.DownloadBlobAsync);
+                    // If using Year-as-Library, strip leading "YYYY/" from mapped paths for this batch
+                    var batchForSubmit = batch;
+                    if (migrationSettings.YearAsLibrary && !string.IsNullOrWhiteSpace(targetLibrary))
+                    {
+                        var prefixToTrim = targetLibrary + "/";
+                        batchForSubmit = batch.Select(r =>
+                        {
+                            var cloned = new BlobToSharePointMigrator.Models.FileRecord
+                            {
+                                Name = r.Name,
+                                BlobPath = r.BlobPath,
+                                MappedPath = r.MappedPath.Replace('\\', '/').StartsWith(prefixToTrim, StringComparison.OrdinalIgnoreCase)
+                                    ? r.MappedPath.Replace('\\', '/')[prefixToTrim.Length..]
+                                    : r.MappedPath.Replace('\\', '/'),
+                                SizeBytes = r.SizeBytes,
+                                ContentType = r.ContentType,
+                                LastModified = r.LastModified,
+                                CreatedOn = r.CreatedOn,
+                                IsAllowed = r.IsAllowed,
+                                SkipReason = r.SkipReason,
+                                Metadata = r.Metadata
+                            };
+                            return cloned;
+                        }).ToList();
+                    }
+                    var jobInfo = await batchSpService.SubmitMigrationJobAsync(batchForSubmit, blobService.DownloadBlobAsync, targetLibrary);
                     logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
                     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
@@ -314,7 +345,7 @@ try
                             SizeBytes = record.SizeBytes,
                             LastModified = record.LastModified,
                             Status = rowStatus,
-                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{migrationSettings.SharePointDocumentLibrary}/{record.MappedPath}",
+                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{targetLibrary}/{record.MappedPath}",
                             Error = rowStatus == "Failed" ? firstError : string.Empty,
                             Duration = "N/A (batch operation)"
                         };
@@ -351,7 +382,7 @@ try
                             SizeBytes = record.SizeBytes,
                             LastModified = record.LastModified,
                             Status = "Failed",
-                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{migrationSettings.SharePointDocumentLibrary}/{record.MappedPath}",
+                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{(migrationSettings.YearAsLibrary ? (record.MappedPath.Replace('\\','/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty) : migrationSettings.SharePointDocumentLibrary)}/{record.MappedPath}",
                             Error = ex.Message,
                             Duration = "N/A (batch operation)"
                         };

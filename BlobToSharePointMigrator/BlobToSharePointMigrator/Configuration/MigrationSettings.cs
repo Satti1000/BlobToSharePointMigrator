@@ -25,6 +25,7 @@ public class MigrationSettings
     public string SharePointTargetFolder    { get; set; } = string.Empty; // optional extra folder root under the library
     public int CsomRequestTimeoutSeconds    { get; set; } = 600;
     public bool UseYyyyCaseNumberPath       { get; set; } = true;
+    public bool YearAsLibrary               { get; set; } = true; // when true, target library title is the year (YYYY)
     public int MaxParallelJobs              { get; set; } = 3;
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName
     public string BlobFolderPrefix          { get; set; } = string.Empty; // optional source filter
