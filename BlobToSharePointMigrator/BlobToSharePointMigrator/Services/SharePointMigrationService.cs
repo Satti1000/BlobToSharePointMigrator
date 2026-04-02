@@ -104,10 +104,29 @@ public class SharePointMigrationService
             _logger.LogInformation("Connected — Site ID: {SiteId}, Web ID: {WebId}, Title: {Title}", _siteId, _webId, _web.Title);
 
             // Resolve the target document library
-            var list = _web.Lists.GetByTitle(_settings.SharePointDocumentLibrary);
-            _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
-            _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
-            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            var documentLibraryTitle = (_settings.SharePointDocumentLibrary ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(documentLibraryTitle))
+            {
+                throw new InvalidOperationException(
+                    "Migration:SharePointDocumentLibrary is empty. Set it to the exact SharePoint library title (for example: 'Documents' or 'Shared Documents').");
+            }
+
+            List list;
+            try
+            {
+                list = _web.Lists.GetByTitle(documentLibraryTitle);
+                _clientContextG.Load(list, l => l.Id, l => l.RootFolder);
+                _clientContextG.Load(list.RootFolder, f => f.UniqueId, f => f.ServerRelativeUrl);
+                await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            }
+            catch (ServerException ex) when (
+                ex.Message.Contains("title", StringComparison.OrdinalIgnoreCase) &&
+                ex.Message.Contains("invalid", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Invalid Migration:SharePointDocumentLibrary value '{documentLibraryTitle}'. Use the exact library title from SharePoint Library Settings (for example: 'Documents' or 'Shared Documents').",
+                    ex);
+            }
 
             _listId = list.Id.ToString();
             _rootFolderId = list.RootFolder.UniqueId.ToString();
@@ -132,11 +151,11 @@ public class SharePointMigrationService
             }
 
             _logger.LogInformation("Target library: {Library} (List ID: {ListId}, Root URL: {RootUrl})",
-                _settings.SharePointDocumentLibrary, _listId, _rootFolderUrl);
+                documentLibraryTitle, _listId, _rootFolderUrl);
         }
         catch (Exception ex)
         {
-            _logger.LogError("Error reading Target library: {Library})", ex.Message);
+            _logger.LogError(ex, "Error resolving target library '{Library}'", _settings.SharePointDocumentLibrary);
             throw;
         }
 

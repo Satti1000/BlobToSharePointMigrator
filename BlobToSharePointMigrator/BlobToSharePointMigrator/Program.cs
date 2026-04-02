@@ -61,8 +61,36 @@ var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
+static void ValidateStartupSettings(MigrationSettings migrationSettings)
+{
+    var errors = new List<string>();
+
+    if (string.IsNullOrWhiteSpace(migrationSettings.BlobConnectionString))
+        errors.Add("Migration:BlobConnectionString is empty.");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SourceContainer))
+        errors.Add("Migration:SourceContainer is empty.");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointSiteUrl))
+        errors.Add("Migration:SharePointSiteUrl is empty.");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
+        errors.Add("Migration:SharePointDocumentLibrary is empty (use exact library title like 'Documents' or 'Shared Documents').");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointClientId))
+        errors.Add("Migration:SharePointClientId is empty.");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointTenantId))
+        errors.Add("Migration:SharePointTenantId is empty.");
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointCertificatePath) &&
+        string.IsNullOrWhiteSpace(migrationSettings.SharePointCertificateThumbprint))
+        errors.Add("Migration certificate is not configured. Set Migration:SharePointCertificatePath (+Password) or Migration:SharePointCertificateThumbprint.");
+
+    if (errors.Count > 0)
+        throw new InvalidOperationException("Startup settings validation failed:\n - " + string.Join("\n - ", errors));
+}
+
 try
 {
+    logger.LogInformation("Running startup configuration precheck...");
+    ValidateStartupSettings(migrationSettings);
+    logger.LogInformation("Startup precheck passed.");
+
     reportSvc.LoadDeltaTracking();
 
     logger.LogInformation("STEP 1/5 - Inventorying Azure Blob Storage...");
@@ -71,9 +99,17 @@ try
     // Optional source prefilter: BlobFolderPrefix
     if (!string.IsNullOrWhiteSpace(migrationSettings.BlobFolderPrefix))
     {
-        var prefix = migrationSettings.BlobFolderPrefix.Replace('\\', '/');
+        var normalizedPrefix = migrationSettings.BlobFolderPrefix
+            .Replace('\\', '/')
+            .Trim('/');
+        var prefixWithSlash = normalizedPrefix + "/";
         var before = records.Count;
-        records = records.Where(r => (r.BlobPath ?? string.Empty).Replace('\\', '/').StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList();
+        records = records.Where(r =>
+        {
+            var path = (r.BlobPath ?? string.Empty).Replace('\\', '/').Trim('/');
+            return path.Equals(normalizedPrefix, StringComparison.OrdinalIgnoreCase) ||
+                   path.StartsWith(prefixWithSlash, StringComparison.OrdinalIgnoreCase);
+        }).ToList();
         logger.LogInformation("Applied BlobFolderPrefix filter: kept {Kept} of {Before} records under '{Prefix}'",
             records.Count, before, migrationSettings.BlobFolderPrefix);
     }
