@@ -53,7 +53,9 @@ var blobService = new BlobInventoryService(settings, migrationSettings, loggerFa
 var transformSvc = new PathTransformService(
     Path.Combine(AppContext.BaseDirectory, migrationSettings.MappingFile),
     migrationSettings.UseYyyyCaseNumberPath,
-    loggerFactory.CreateLogger<PathTransformService>());
+    loggerFactory.CreateLogger<PathTransformService>(),
+    migrationSettings.BlobFolderPrefix,
+    migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 

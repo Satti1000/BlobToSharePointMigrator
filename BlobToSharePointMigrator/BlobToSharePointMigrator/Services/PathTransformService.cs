@@ -9,14 +9,23 @@ public class PathTransformService
 {
     private readonly MappingConfig _mappingConfig;
     private readonly bool _useYyyyCaseNumberPath;
+    private readonly string _blobFolderPrefix;
+    private readonly string _sharePointTargetFolder;
     // Future: dynamic ETL rules switchable via config. For now, behaves like default mapping.
     private readonly ILogger<PathTransformService> _logger;
     private static readonly Regex InvalidSharePointChars = new Regex(@"[~""#%&\*\{\}\\:<>\?/+\|]", RegexOptions.Compiled);
 
-    public PathTransformService(string mappingFilePath, bool useYyyyCaseNumberPath, ILogger<PathTransformService> logger)
+    public PathTransformService(
+        string mappingFilePath,
+        bool useYyyyCaseNumberPath,
+        ILogger<PathTransformService> logger,
+        string? blobFolderPrefix = null,
+        string? sharePointTargetFolder = null)
     {
         _logger = logger;
         _useYyyyCaseNumberPath = useYyyyCaseNumberPath;
+        _blobFolderPrefix = (blobFolderPrefix ?? string.Empty).Replace('\\', '/').Trim('/');
+        _sharePointTargetFolder = (sharePointTargetFolder ?? string.Empty).Replace('\\', '/').Trim('/');
         var json = File.ReadAllText(mappingFilePath);
         _mappingConfig = JsonConvert.DeserializeObject<MappingConfig>(json)
             ?? throw new InvalidOperationException("Failed to load mapping.json");
@@ -36,6 +45,41 @@ public class PathTransformService
                 _logger.LogDebug("Mapped (YYYY/CaseNumber): {Source} -> {Destination}", blobPath, safe);
                 return safe;
             }
+        }
+
+        // DynamicETL-compatible fallback: compute relative path vs. BlobFolderPrefix and optionally
+        // prepend SharePointTargetFolder (without duplicating if already present).
+        if (!string.IsNullOrWhiteSpace(_blobFolderPrefix) || !string.IsNullOrWhiteSpace(_sharePointTargetFolder))
+        {
+            string relativePath;
+            if (string.IsNullOrWhiteSpace(_blobFolderPrefix))
+            {
+                relativePath = normalizedBlobPath;
+            }
+            else
+            {
+                relativePath = normalizedBlobPath.StartsWith(_blobFolderPrefix + "/", StringComparison.OrdinalIgnoreCase)
+                    ? normalizedBlobPath[(_blobFolderPrefix.Length + 1)..]
+                    : normalizedBlobPath;
+            }
+
+            string candidate;
+            if (!string.IsNullOrWhiteSpace(_sharePointTargetFolder))
+            {
+                candidate = relativePath.StartsWith(_sharePointTargetFolder + "/", StringComparison.OrdinalIgnoreCase)
+                    ? relativePath
+                    : $"{_sharePointTargetFolder}/{relativePath}";
+            }
+            else
+            {
+                candidate = string.IsNullOrWhiteSpace(_blobFolderPrefix)
+                    ? normalizedBlobPath
+                    : $"{_blobFolderPrefix}/{relativePath}";
+            }
+
+            var safeDyn = SanitizeSharePointRelativePath(candidate);
+            _logger.LogDebug("Mapped (DynamicETL fallback): {Source} -> {Destination}", blobPath, safeDyn);
+            return safeDyn;
         }
 
         var fileName  = Path.GetFileName(normalizedBlobPath);

@@ -42,6 +42,10 @@ public class SharePointMigrationService
     private string _rootFolderUrl = string.Empty;
     private string _queueUri = string.Empty;
     private byte[] _encryptionKey = Array.Empty<byte>();
+    // Progress log deduplication for queue polling
+    private int _lastQueueFilesCreated = -1;
+    private int _lastQueueErrors = -1;
+    private DateTime _lastQueueProgressLogUtc = DateTime.MinValue;
 
     public SharePointMigrationService(IConfigurationSection processFlags, MigrationSettings settings, ILogger<SharePointMigrationService> logger)
     {
@@ -536,9 +540,20 @@ public class SharePointMigrationService
                     summary.TotalErrors = Math.Max(summary.TotalErrors, ParseInt(json["TotalErrors"]?.ToString()));
                     var totalWarnings = ParseInt(json["TotalWarnings"]?.ToString());
                     var objectsProcessed = ParseInt(json["ObjectsProcessed"]?.ToString());
-                    _logger.LogInformation(
-                        "Queue progress: created={FilesCreated}, objects={ObjectsProcessed}, errors={Errors}, warnings={Warnings}",
-                        summary.FilesCreated, objectsProcessed, summary.TotalErrors, totalWarnings);
+
+                    // Only log if progress changed or at least 30s passed since last progress log
+                    var nowUtc = DateTime.UtcNow;
+                    var changed = summary.FilesCreated != _lastQueueFilesCreated || summary.TotalErrors != _lastQueueErrors;
+                    var intervalElapsed = (nowUtc - _lastQueueProgressLogUtc) >= TimeSpan.FromSeconds(30);
+                    if (changed || intervalElapsed)
+                    {
+                        _lastQueueFilesCreated = summary.FilesCreated;
+                        _lastQueueErrors = summary.TotalErrors;
+                        _lastQueueProgressLogUtc = nowUtc;
+                        _logger.LogInformation(
+                            "Queue progress: created={FilesCreated}, objects={ObjectsProcessed}, errors={Errors}, warnings={Warnings}",
+                            summary.FilesCreated, objectsProcessed, summary.TotalErrors, totalWarnings);
+                    }
                 }
 
                 if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))
