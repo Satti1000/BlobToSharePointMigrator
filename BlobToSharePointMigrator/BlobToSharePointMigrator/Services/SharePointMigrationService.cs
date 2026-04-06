@@ -449,6 +449,22 @@ public class SharePointMigrationService
                 if (queueSummary.Status is "Completed" or "CompletedWithErrors" or "Failed")
                 {
                     _logger.LogInformation("Migration job {JobId} finalized with queueStatus={Status}.", jobId, queueSummary.Status);
+                        if (queueSummary.Status == "Failed")
+                        {
+                            var reason = queueSummary.FatalReason
+                                ?? queueSummary.Errors.FirstOrDefault()
+                                ?? "No specific reason provided by SPMI. See errors below.";
+                            _logger.LogError("Failed reason: {Reason}", reason);
+                        }
+                        if (queueSummary.Errors.Count > 0)
+                        {
+                            _logger.LogInformation("---- Job errors (non-existence) ----");
+                            foreach (var err in queueSummary.Errors)
+                            {
+                                _logger.LogError("{Error}", err);
+                            }
+                            _logger.LogInformation("---- End errors ----");
+                        }
                     return new MigrationJobInfo
                     {
                         JobId = jobId,
@@ -456,7 +472,8 @@ public class SharePointMigrationService
                         Progress = 100,
                         CreatedDateTime = DateTime.UtcNow.ToString("O"),
                         ProcessedFileCount = queueSummary.FilesCreated,
-                        FailedFileCount = queueSummary.TotalErrors,
+                        // Treat only non-existence errors as failures
+                        FailedFileCount = Math.Max(queueSummary.OtherErrorCount, 0),
                         AlreadyExistsCount = queueSummary.AlreadyExistsCount,
                         OtherErrorCount = queueSummary.OtherErrorCount,
                         Errors = queueSummary.Errors
@@ -541,19 +558,42 @@ public class SharePointMigrationService
                 if (eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase))
                 {
                     summary.SawFatalError = true;
+                    summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
                 }
 
                 if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
                     || eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (message.Contains("already exists", StringComparison.OrdinalIgnoreCase))
-                        summary.AlreadyExistsCount++;
-                    else if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase))
-                        summary.OtherErrorCount++;
+                    // Normalize message to reduce noisy call stacks that SPMI embeds
+                    var normalizedMessage = message;
+                    var callstackIndex = normalizedMessage.IndexOf("CallStack --", StringComparison.OrdinalIgnoreCase);
+                    if (callstackIndex > 0)
+                        normalizedMessage = normalizedMessage[..callstackIndex].TrimEnd();
 
-                    summary.Errors.Add($"[{eventType}] {message}");
-                    _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, message);
+                    // Downgrade "already exists" to informational skip (do NOT treat as error)
+                    if (normalizedMessage.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+                    {
+                        summary.AlreadyExistsCount++;
+                        _logger.LogInformation("Skipped (exists): {Message}", normalizedMessage);
+                    }
+                    // Known benign SPMI warning during submit; treat as informational noise
+                    else if (normalizedMessage.Contains("The source type is not specified", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogInformation("SPMI notice: {Message}", normalizedMessage);
+                    }
+                    else
+                    {
+                        if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase))
+                            summary.OtherErrorCount++;
+
+                        summary.Errors.Add($"[{eventType}] {normalizedMessage}");
+                        var isWarning = eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase);
+                        if (isWarning)
+                            _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                        else
+                            _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                    }
                 }
 
                 if (eventType.Contains("JobProgress", StringComparison.OrdinalIgnoreCase))
@@ -593,11 +633,15 @@ public class SharePointMigrationService
         if (summary.SawFinalEvent)
         {
             if (summary.SawFatalError)
+            {
                 summary.Status = "Failed";
-            else if (summary.Errors.Count > 0 || summary.TotalErrors > 0)
-                summary.Status = "CompletedWithErrors";
+            }
             else
-                summary.Status = "Completed";
+            {
+                // Only treat non-existence errors as errors for final status.
+                var effectiveErrors = Math.Max(summary.OtherErrorCount, summary.Errors.Count);
+                summary.Status = effectiveErrors > 0 ? "CompletedWithErrors" : "Completed";
+            }
         }
 
         return summary;
@@ -609,6 +653,7 @@ public class SharePointMigrationService
         public List<string> Errors { get; } = new();
         public bool SawFinalEvent { get; set; }
         public bool SawFatalError { get; set; }
+        public string? FatalReason { get; set; }
         public int FilesCreated { get; set; }
         public int TotalErrors { get; set; }
         public int AlreadyExistsCount { get; set; }

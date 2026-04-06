@@ -95,23 +95,34 @@ public class ReportService
         return set;
     }
 
-    public void PrintSummary(List<MigrationResult> results, List<FileRecord> skipped, int alreadyExistsConflicts = 0)
+    public void PrintSummary(
+        List<MigrationResult> results,
+        List<FileRecord> skipped,
+        int alreadyExistsConflicts = 0,
+        int blobsListed = 0,
+        int filesPlannedToMigrate = 0,
+        int estimatedCaseFolders = 0,
+        int otherErrorConflicts = 0)
     {
         var success  = results.Count(r => r.Status == "Success");
         var partial  = results.Count(r => r.Status == "PartialSuccess");
         var failed   = results.Count(r => r.Status == "Failed");
 
+        // Elaborate run summary (styled after Application No.1)
         Console.WriteLine();
-        Console.WriteLine("===================================================");
-        Console.WriteLine("   MIGRATION COMPLETE");
-        Console.WriteLine("===================================================");
-        Console.WriteLine($"   Succeeded  : {success}");
-        Console.WriteLine($"   Partial    : {partial}");
-        Console.WriteLine($"   Failed     : {failed}");
-        Console.WriteLine($"   Skipped    : {skipped.Count}");
-        Console.WriteLine($"   Exists     : {alreadyExistsConflicts}");
-        Console.WriteLine($"   Report     : {_settings.ReportFile}");
-        Console.WriteLine("===================================================");
+        Console.WriteLine("========== BlobToSharePointSync run summary ==========");
+        if (blobsListed > 0) Console.WriteLine($"Blobs listed (container/prefix): {blobsListed}");
+        Console.WriteLine($"Skipped (invalid/filtered): {skipped.Count}");
+        Console.WriteLine($"Skipped (already exists in target): {alreadyExistsConflicts}");
+        if (filesPlannedToMigrate > 0) Console.WriteLine($"Files planned to migrate: {filesPlannedToMigrate}");
+        Console.WriteLine($"Files uploaded successfully: {success + partial}");
+        Console.WriteLine($"Failed uploads: {failed}");
+        if (estimatedCaseFolders > 0) Console.WriteLine($"Case-number folders patched: {estimatedCaseFolders}");
+        Console.WriteLine($"Other errors (non-existence): {otherErrorConflicts}");
+        Console.WriteLine("======================================================");
+        Console.WriteLine($"Report saved: {_settings.ReportFile}");
+        Console.WriteLine($"Failed-items file: {_settings.FailedItemsFile}");
+        Console.WriteLine("======================================================");
         Console.WriteLine();
 
         if (results.Any())

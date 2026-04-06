@@ -180,7 +180,7 @@ try
     {
         logger.LogInformation("No files to migrate (all already migrated or filtered)");
         reportSvc.SaveDeltaTracking();
-        reportSvc.PrintSummary(new List<BlobToSharePointMigrator.Models.MigrationResult>(), skipped);
+        reportSvc.PrintSummary(new List<BlobToSharePointMigrator.Models.MigrationResult>(), skipped, 0, records.Count, toMigrate.Count);
         Environment.Exit(0);
     }
 
@@ -406,7 +406,21 @@ try
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
     reportSvc.WriteFailedItems(allResults);
-    reportSvc.PrintSummary(allResults, skipped, aggregateAlreadyExists);
+    // Recompute estimated case-folder count for summary
+    var estimatedCaseFolders = 0;
+    if (migrationSettings.UseYyyyCaseNumberPath)
+    {
+        var cf = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in toMigrate)
+        {
+            var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+            var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segs.Length >= 2 && System.Text.RegularExpressions.Regex.IsMatch(segs[0], "^\\d{4}$") && System.Text.RegularExpressions.Regex.IsMatch(segs[1], "^\\d+$"))
+                cf.Add($"{segs[0]}/{segs[1]}");
+        }
+        estimatedCaseFolders = cf.Count;
+    }
+    reportSvc.PrintSummary(allResults, skipped, aggregateAlreadyExists, records.Count, toMigrate.Count, estimatedCaseFolders, aggregateOtherErrors);
 
     logger.LogInformation(string.Empty);
     logger.LogInformation("Migration complete! Submitted jobs: {Jobs}, Total files: {Total}", batchesToRun.Count, toMigrate.Count);
