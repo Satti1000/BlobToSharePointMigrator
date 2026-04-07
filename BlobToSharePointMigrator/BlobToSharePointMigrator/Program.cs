@@ -58,6 +58,7 @@ var transformSvc = new PathTransformService(
     migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
+var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
@@ -155,6 +156,9 @@ try
     }
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
+
+    logger.LogInformation("STEP 2.5/5 - Enriching metadata from case XML...");
+    await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -267,6 +271,9 @@ try
                     }
                     caseLabel = cases.Count == 1 ? cases.First() : (cases.Count > 1 ? $"{cases.Count} cases" : "mixed");
                     var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
+                    var caseIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseId", out var value) && !string.IsNullOrWhiteSpace(value));
+                    var caseTypeAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseType", out var value) && !string.IsNullOrWhiteSpace(value));
+                    var documentIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("DocumentId", out var value) && !string.IsNullOrWhiteSpace(value));
 
                     // Determine target library for this batch
                     string targetLibrary = migrationSettings.YearAsLibrary
@@ -274,8 +281,17 @@ try
                             .FirstOrDefault())?.Trim() ?? string.Empty)
                         : migrationSettings.SharePointDocumentLibrary;
 
-                    logger.LogInformation("Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — sample file: {File} — library: {Library}",
-                        index + 1, batchesToRun.Count, batch.Count, caseLabel, sampleFile, targetLibrary);
+                    logger.LogInformation(
+                        "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount}, DocumentId={DocumentIdCount} — sample file: {File} — library: {Library}",
+                        index + 1,
+                        batchesToRun.Count,
+                        batch.Count,
+                        caseLabel,
+                        caseIdAssignedCount,
+                        caseTypeAssignedCount,
+                        documentIdAssignedCount,
+                        sampleFile,
+                        targetLibrary);
                     // Use isolated service/context per concurrent batch to avoid shared-state contention.
                     var batchSpService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
                     await batchSpService.ConnectAsync();

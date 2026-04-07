@@ -42,6 +42,8 @@ public class SharePointMigrationService
     private string _rootFolderUrl = string.Empty;
     private string _queueUri = string.Empty;
     private byte[] _encryptionKey = Array.Empty<byte>();
+    private readonly Dictionary<string, string> _effectiveMetadataFieldMap;
+    private readonly Dictionary<string, Dictionary<string, string>> _resolvedMetadataFieldMapByLibrary = new(StringComparer.OrdinalIgnoreCase);
     // Progress log deduplication for queue polling
     private int _lastQueueFilesCreated = -1;
     private int _lastQueueErrors = -1;
@@ -52,6 +54,7 @@ public class SharePointMigrationService
         _settings = settings;
         _logger = logger;
         _processFlags = processFlags;
+        _effectiveMetadataFieldMap = new Dictionary<string, string>(_settings.MetadataFieldMap, StringComparer.OrdinalIgnoreCase);
     }
 
     private string GetTenantName()
@@ -253,6 +256,8 @@ public class SharePointMigrationService
         if (skippedInvalidPath > 0)
             _logger.LogWarning("Skipped {SkippedCount} item(s) due to invalid/special-character paths. Continuing with {ValidCount} item(s).",
                 skippedInvalidPath, validRecords.Count);
+
+        await EnsureMetadataFieldMappingsAsync(validRecords, targetLibraryTitle).ConfigureAwait(false);
 
         // Step 1: Provision SharePoint-managed migration containers + queue
         _logger.LogInformation("Provisioning SharePoint migration containers and queue...");
@@ -859,7 +864,7 @@ public class SharePointMigrationService
                 foreach (var kvp in record.Metadata)
                 {
                     if (string.IsNullOrWhiteSpace(kvp.Key)) continue;
-                    if (!_settings.MetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
+                    if (!_effectiveMetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
                         string.IsNullOrWhiteSpace(fieldInternalName))
                     {
                         continue; // only mapped keys are emitted
@@ -1034,5 +1039,85 @@ public class SharePointMigrationService
         using var md5 = System.Security.Cryptography.MD5.Create();
         var hash = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(input));
         return new Guid(hash);
+    }
+
+    private async Task EnsureMetadataFieldMappingsAsync(IEnumerable<FileRecord> records, string libraryTitle)
+    {
+        _effectiveMetadataFieldMap.Clear();
+        foreach (var kvp in _settings.MetadataFieldMap)
+        {
+            if (!string.IsNullOrWhiteSpace(kvp.Key) && !string.IsNullOrWhiteSpace(kvp.Value))
+                _effectiveMetadataFieldMap[kvp.Key] = kvp.Value;
+        }
+
+        var requiredKeys = records
+            .Where(r => r.Metadata is { Count: > 0 })
+            .SelectMany(r => r.Metadata.Keys)
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (requiredKeys.Count == 0)
+            return;
+
+        if (!_resolvedMetadataFieldMapByLibrary.TryGetValue(libraryTitle, out var libraryCache))
+        {
+            libraryCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            _resolvedMetadataFieldMapByLibrary[libraryTitle] = libraryCache;
+        }
+
+        foreach (var metadataKey in requiredKeys)
+        {
+            if (_effectiveMetadataFieldMap.ContainsKey(metadataKey))
+                continue;
+
+            var displayName = GetMetadataDisplayName(metadataKey);
+            if (string.IsNullOrWhiteSpace(displayName))
+                continue;
+
+            if (!libraryCache.TryGetValue(metadataKey, out var internalName))
+            {
+                internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
+                libraryCache[metadataKey] = internalName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(internalName))
+            {
+                _effectiveMetadataFieldMap[metadataKey] = internalName;
+                _logger.LogInformation("Resolved SharePoint metadata field mapping: {MetadataKey} -> {InternalName} (library: {Library})",
+                    metadataKey, internalName, libraryTitle);
+            }
+            else
+            {
+                _logger.LogWarning("Could not resolve SharePoint field internal name for metadata key '{MetadataKey}' using display name '{DisplayName}' in library '{Library}'.",
+                    metadataKey, displayName, libraryTitle);
+            }
+        }
+    }
+
+    private string? GetMetadataDisplayName(string metadataKey)
+    {
+        if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase))
+            return _processFlags.GetSection("SHAREPOINT_CASEID_COLUMN_DISPLAY_NAME").Value;
+        if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
+            return _processFlags.GetSection("SHAREPOINT_CASETYPE_COLUMN_DISPLAY_NAME").Value;
+        if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
+            return _processFlags.GetSection("SHAREPOINT_DOCUMENTID_COLUMN_DISPLAY_NAME").Value ?? "Document ID";
+
+        return null;
+    }
+
+    private async Task<string?> ResolveFieldInternalNameAsync(string libraryTitle, string displayName)
+    {
+        var list = _web.Lists.GetByTitle(libraryTitle);
+        var fields = list.Fields;
+        _clientContextG.Load(fields, fs => fs.Include(f => f.InternalName, f => f.Title));
+        await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+
+        var field = fields.FirstOrDefault(f =>
+            string.Equals(f.Title, displayName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(f.InternalName, displayName, StringComparison.OrdinalIgnoreCase));
+
+        return field?.InternalName;
     }
 }
