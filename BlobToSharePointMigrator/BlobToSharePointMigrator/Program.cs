@@ -315,7 +315,8 @@ try
                                 CreatedOn = r.CreatedOn,
                                 IsAllowed = r.IsAllowed,
                                 SkipReason = r.SkipReason,
-                                Metadata = r.Metadata
+                                Metadata = r.Metadata,
+                                FolderMetadata = r.FolderMetadata
                             };
                             return cloned;
                         }).ToList();

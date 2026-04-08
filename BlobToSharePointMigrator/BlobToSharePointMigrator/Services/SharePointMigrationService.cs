@@ -785,6 +785,7 @@ public class SharePointMigrationService
 
         // Track emitted folders
         var emittedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var folderMetadataByPath = BuildFolderMetadataLookup(records);
 
         foreach (var record in records)
         {
@@ -810,19 +811,22 @@ public class SharePointMigrationService
                         ? _rootFolderId
                         : GenerateDeterministicGuid(parentPath).ToString();
 
+                    var folderElement = new XElement(ns + "Folder",
+                        new XAttribute("Id", folderId),
+                        new XAttribute("Url", $"{_rootFolderUrl}/{folderAccumulator}"),
+                        new XAttribute("ParentFolderId", parentFolderId),
+                        new XAttribute("ParentWebId", _webId),
+                        new XAttribute("ParentWebUrl", webUrl),
+                        new XAttribute("Name", parts[i]));
+                    AppendMetadataProperties(folderElement, folderMetadataByPath, folderAccumulator, ns);
+
                     root.Add(new XElement(ns + "SPObject",
                         new XAttribute("Id", folderId),
                         new XAttribute("ObjectType", "SPFolder"),
                         new XAttribute("ParentId", parentFolderId),
                         new XAttribute("ParentWebId", _webId),
                         new XAttribute("ParentWebUrl", webUrl),
-                        new XElement(ns + "Folder",
-                            new XAttribute("Id", folderId),
-                            new XAttribute("Url", $"{_rootFolderUrl}/{folderAccumulator}"),
-                            new XAttribute("ParentFolderId", parentFolderId),
-                            new XAttribute("ParentWebId", _webId),
-                            new XAttribute("ParentWebUrl", webUrl),
-                            new XAttribute("Name", parts[i]))));
+                        folderElement));
                 }
             }
 
@@ -860,31 +864,104 @@ public class SharePointMigrationService
             // Optional: include metadata as Properties under File when explicitly enabled and mapped
             if (record.Metadata is { Count: > 0 })
             {
-                var properties = new XElement(ns + "Properties");
-                foreach (var kvp in record.Metadata)
-                {
-                    if (string.IsNullOrWhiteSpace(kvp.Key)) continue;
-                    if (!_effectiveMetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
-                        string.IsNullOrWhiteSpace(fieldInternalName))
-                    {
-                        continue; // only mapped keys are emitted
-                    }
-                    var value = kvp.Value ?? string.Empty;
-                    properties.Add(new XElement(ns + "Property",
-                        new XAttribute("Name", fieldInternalName),
-                        value));
-                }
-
-                if (properties.HasElements)
-                {
-                    fileElement.Element(ns + "File")!.Add(properties);
-                }
+                AppendMetadataProperties(fileElement.Element(ns + "File")!, record.Metadata, ns);
             }
 
             root.Add(fileElement);
         }
 
         return XmlToString(new XDocument(new XDeclaration("1.0", "utf-8", null), root));
+    }
+
+    private Dictionary<string, IDictionary<string, string>> BuildFolderMetadataLookup(IEnumerable<FileRecord> records)
+    {
+        var folderMetadataByPath = new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var record in records)
+        {
+            if (record.FolderMetadata is not { Count: > 0 })
+                continue;
+
+            var recordPath = PathTransformService.SanitizeSharePointRelativePath(
+                record.MappedPath.Replace('\\', '/').Trim('/'));
+            if (string.IsNullOrWhiteSpace(recordPath))
+                continue;
+
+            var segments = recordPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < segments.Length - 1; i++)
+            {
+                var folderPath = string.Join("/", segments.Take(i + 1));
+                var relativeKey = NormalizeFolderMetadataRelativePath(folderPath, segments[0]);
+                if (string.IsNullOrWhiteSpace(relativeKey))
+                    continue;
+
+                if (!record.FolderMetadata.TryGetValue(relativeKey, out var metadata) || metadata.Count == 0)
+                    continue;
+
+                if (!folderMetadataByPath.TryGetValue(folderPath, out var merged))
+                {
+                    merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    folderMetadataByPath[folderPath] = merged;
+                }
+
+                foreach (var kvp in metadata)
+                {
+                    if (!string.IsNullOrWhiteSpace(kvp.Key))
+                        merged[kvp.Key] = kvp.Value ?? string.Empty;
+                }
+            }
+        }
+
+        return folderMetadataByPath;
+    }
+
+    private void AppendMetadataProperties(
+        XElement targetElement,
+        IDictionary<string, string> metadata,
+        XNamespace ns)
+    {
+        var properties = new XElement(ns + "Properties");
+        foreach (var kvp in metadata)
+        {
+            if (string.IsNullOrWhiteSpace(kvp.Key)) continue;
+            if (!_effectiveMetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
+                string.IsNullOrWhiteSpace(fieldInternalName))
+            {
+                continue;
+            }
+
+            var value = kvp.Value ?? string.Empty;
+            properties.Add(new XElement(ns + "Property",
+                new XAttribute("Name", fieldInternalName),
+                value));
+        }
+
+        if (properties.HasElements)
+            targetElement.Add(properties);
+    }
+
+    private void AppendMetadataProperties(
+        XElement targetElement,
+        IDictionary<string, IDictionary<string, string>> folderMetadataByPath,
+        string folderPath,
+        XNamespace ns)
+    {
+        if (!folderMetadataByPath.TryGetValue(folderPath, out var metadata) || metadata.Count == 0)
+            return;
+
+        AppendMetadataProperties(targetElement, metadata, ns);
+    }
+
+    private static string NormalizeFolderMetadataRelativePath(string fullFolderPath, string libraryRootSegment)
+    {
+        var normalized = PathTransformService.SanitizeSharePointRelativePath(fullFolderPath.Replace('\\', '/').Trim('/'));
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        var prefix = libraryRootSegment.Trim('/') + "/";
+        return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? normalized[prefix.Length..]
+            : normalized;
     }
 
     private string GenerateRequirements()

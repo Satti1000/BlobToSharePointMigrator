@@ -12,4 +12,6 @@ public class FileRecord
     public bool   IsAllowed      { get; set; }
     public string SkipReason     { get; set; } = string.Empty;
     public IDictionary<string, string> Metadata { get; set; } = new Dictionary<string, string>();
+    public IDictionary<string, IDictionary<string, string>> FolderMetadata { get; set; } =
+        new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
 }

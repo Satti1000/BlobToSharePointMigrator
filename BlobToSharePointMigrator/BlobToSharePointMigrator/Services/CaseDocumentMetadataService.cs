@@ -11,6 +11,7 @@ public class CaseDocumentMetadataService
     private static readonly Regex CaseDocumentsFolderRegex = new(@"^(\d+)_Documents$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CaseManifestRegex = new(@"^case_(\d+)_documents\.xml$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CollapseWhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
+    private const int UnmatchedSampleLimit = 5;
     private readonly ILogger<CaseDocumentMetadataService> _logger;
 
     public CaseDocumentMetadataService(ILogger<CaseDocumentMetadataService> logger)
@@ -44,6 +45,7 @@ public class CaseDocumentMetadataService
         var documentIdAssigned = 0;
         var documentIdUnmatched = 0;
         var manifestMissing = 0;
+        var folderDocumentIdAssigned = 0;
 
         foreach (var group in caseGroups)
         {
@@ -51,6 +53,8 @@ public class CaseDocumentMetadataService
             var recordsInCase = group.Select(x => x.Record).ToList();
             var caseNumber = TryExtractCaseNumber(recordsInCase[0].BlobPath);
             var caseType = TryExtractCaseType(recordsInCase[0].BlobPath);
+            var unmatchedInCase = 0;
+            var unmatchedSamples = new List<string>();
 
             foreach (var record in recordsInCase)
             {
@@ -96,7 +100,7 @@ public class CaseDocumentMetadataService
                 if (IsCaseManifestFile(record.Name))
                     continue;
 
-                if (manifest.TryAssignDocumentId(record.Name, out var documentId, out var matchMode))
+                if (manifest.TryAssignDocumentId(record.Name, record.ContentType, out var documentId, out var matchMode))
                 {
                     EnsureMetadataDictionary(record)["DocumentId"] = documentId;
                     documentIdAssigned++;
@@ -106,9 +110,35 @@ public class CaseDocumentMetadataService
                 else
                 {
                     documentIdUnmatched++;
-                    _logger.LogWarning("No DocumentId match found in '{ManifestBlobPath}' for blob '{BlobPath}' (file name '{FileName}').",
-                        manifestBlobPath, record.BlobPath, record.Name);
+                    unmatchedInCase++;
+                    if (unmatchedSamples.Count < UnmatchedSampleLimit)
+                    {
+                        unmatchedSamples.Add($"{record.Name} [{record.ContentType}]");
+                    }
                 }
+
+                foreach (var folderMatch in manifest.FindFolderDocumentIds(record.MappedPath))
+                {
+                    if (TryAssignFolderDocumentId(record, folderMatch.RelativeFolderPath, folderMatch.DocumentId))
+                    {
+                        folderDocumentIdAssigned++;
+                        _logger.LogDebug(
+                            "Assigned folder DocumentId from manifest: {BlobPath} -> {FolderPath} ({DocumentId})",
+                            record.BlobPath,
+                            folderMatch.RelativeFolderPath,
+                            folderMatch.DocumentId);
+                    }
+                }
+            }
+
+            if (unmatchedInCase > 0)
+            {
+                _logger.LogWarning(
+                    "No DocumentId match found for {Count} file(s) in '{ManifestBlobPath}' for case folder '{CaseFolderKey}'. Continuing without DocumentId. Sample file(s): {Samples}",
+                    unmatchedInCase,
+                    manifestBlobPath,
+                    caseFolderKey,
+                    string.Join(", ", unmatchedSamples));
             }
         }
 
@@ -119,6 +149,10 @@ public class CaseDocumentMetadataService
             documentIdAssigned,
             documentIdUnmatched,
             manifestMissing);
+        if (folderDocumentIdAssigned > 0)
+        {
+            _logger.LogInformation("Folder-level DocumentId assignments: {FolderDocumentIdAssigned}", folderDocumentIdAssigned);
+        }
     }
 
     internal static string? TryExtractCaseNumber(string blobPath)
@@ -160,6 +194,32 @@ public class CaseDocumentMetadataService
         }
 
         return record.Metadata;
+    }
+
+    private static bool TryAssignFolderDocumentId(FileRecord record, string relativeFolderPath, string documentId)
+    {
+        if (string.IsNullOrWhiteSpace(relativeFolderPath) || string.IsNullOrWhiteSpace(documentId))
+            return false;
+
+        var normalizedRelativeFolderPath = NormalizeRelativePathForMatch(relativeFolderPath);
+        if (string.IsNullOrWhiteSpace(normalizedRelativeFolderPath))
+            return false;
+
+        record.FolderMetadata ??= new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        if (!record.FolderMetadata.TryGetValue(normalizedRelativeFolderPath, out var metadata))
+        {
+            metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            record.FolderMetadata[normalizedRelativeFolderPath] = metadata;
+        }
+
+        if (metadata.TryGetValue("DocumentId", out var existing) &&
+            string.Equals(existing, documentId, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        metadata["DocumentId"] = documentId;
+        return true;
     }
 
     private static Dictionary<string, string> BuildXmlLookupByCaseFolder(IReadOnlyCollection<FileRecord> allRecords)
@@ -210,15 +270,24 @@ public class CaseDocumentMetadataService
 
     private sealed class CaseManifestIndex
     {
-        private readonly Dictionary<string, Queue<ManifestDocument>> _exactNameQueues;
-        private readonly Dictionary<string, Queue<ManifestDocument>> _normalizedNameQueues;
+        private readonly Dictionary<string, List<ManifestDocument>> _exactNameLookup;
+        private readonly Dictionary<string, List<ManifestDocument>> _normalizedNameLookup;
+        private readonly Dictionary<string, List<ManifestDocument>> _typedNameLookup;
+        private readonly Dictionary<string, List<ManifestDocument>> _stemNameLookup;
+        private readonly List<ManifestFolderDocument> _folderDocuments;
 
         private CaseManifestIndex(
-            Dictionary<string, Queue<ManifestDocument>> exactNameQueues,
-            Dictionary<string, Queue<ManifestDocument>> normalizedNameQueues)
+            Dictionary<string, List<ManifestDocument>> exactNameLookup,
+            Dictionary<string, List<ManifestDocument>> normalizedNameLookup,
+            Dictionary<string, List<ManifestDocument>> typedNameLookup,
+            Dictionary<string, List<ManifestDocument>> stemNameLookup,
+            List<ManifestFolderDocument> folderDocuments)
         {
-            _exactNameQueues = exactNameQueues;
-            _normalizedNameQueues = normalizedNameQueues;
+            _exactNameLookup = exactNameLookup;
+            _normalizedNameLookup = normalizedNameLookup;
+            _typedNameLookup = typedNameLookup;
+            _stemNameLookup = stemNameLookup;
+            _folderDocuments = folderDocuments;
         }
 
         public static async Task<CaseManifestIndex> LoadAsync(Stream xmlStream)
@@ -229,34 +298,67 @@ public class CaseDocumentMetadataService
                 .Select((element, index) => new ManifestDocument(
                     id: element.Attribute("Id")?.Value?.Trim() ?? string.Empty,
                     name: element.Attribute("Name")?.Value?.Trim() ?? string.Empty,
+                    type: element.Attribute("Type")?.Value?.Trim() ?? string.Empty,
+                    category: element.Attribute("Category")?.Value?.Trim() ?? string.Empty,
+                    source: element.Attribute("Source")?.Value?.Trim() ?? string.Empty,
                     sequence: index))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Name))
                 .ToList()
                 ?? new List<ManifestDocument>();
 
-            var exact = entries
+            var folderEntries = entries
+                .Where(IsFolderLikeDocument)
+                .ToList();
+
+            var fileEntries = entries
+                .Where(x => !IsFolderLikeDocument(x))
+                .ToList();
+
+            var folderDocuments = folderEntries
+                .Select(CreateFolderDocument)
+                .Where(x => x != null)
+                .Cast<ManifestFolderDocument>()
+                .OrderBy(x => x.Sequence)
+                .ToList();
+
+            var exact = fileEntries
                 .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => new Queue<ManifestDocument>(g.OrderBy(x => x.Sequence)),
+                    g => g.OrderBy(x => x.Sequence).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
-            var normalized = entries
-                .GroupBy(x => NormalizeFileNameForMatch(x.Name), StringComparer.OrdinalIgnoreCase)
+            var normalized = fileEntries
+                .GroupBy(x => x.NormalizedName, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => new Queue<ManifestDocument>(g.OrderBy(x => x.Sequence)),
+                    g => g.OrderBy(x => x.Sequence).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
-            return new CaseManifestIndex(exact, normalized);
+            var typed = fileEntries
+                .SelectMany(x => x.ExpectedTypedNames.Select(name => new { Name = name, Document = x }))
+                .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(x => x.Document).OrderBy(x => x.Sequence).ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var stems = fileEntries
+                .GroupBy(x => x.NormalizedStem, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.OrderBy(x => x.Sequence).ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            return new CaseManifestIndex(exact, normalized, typed, stems, folderDocuments);
         }
 
-        public bool TryAssignDocumentId(string fileName, out string documentId, out string matchMode)
+        public bool TryAssignDocumentId(string fileName, string? contentType, out string documentId, out string matchMode)
         {
             documentId = string.Empty;
             matchMode = string.Empty;
 
-            if (TryTakeUnassigned(_exactNameQueues, fileName, out var exact))
+            if (TryTakeUnassigned(_exactNameLookup, fileName, out var exact))
             {
                 exact.Assigned = true;
                 documentId = exact.Id;
@@ -265,7 +367,7 @@ public class CaseDocumentMetadataService
             }
 
             var normalizedName = NormalizeFileNameForMatch(fileName);
-            if (TryTakeUnassigned(_normalizedNameQueues, normalizedName, out var normalized))
+            if (TryTakeUnassigned(_normalizedNameLookup, normalizedName, out var normalized))
             {
                 normalized.Assigned = true;
                 documentId = normalized.Id;
@@ -273,21 +375,53 @@ public class CaseDocumentMetadataService
                 return true;
             }
 
+            if (TryTakeUnassigned(_typedNameLookup, normalizedName, out var typed))
+            {
+                typed.Assigned = true;
+                documentId = typed.Id;
+                matchMode = "name+type";
+                return true;
+            }
+
+            var normalizedStem = NormalizeFileStemForMatch(fileName);
+            if (!string.IsNullOrWhiteSpace(normalizedStem) &&
+                TryTakeUnassigned(_stemNameLookup, normalizedStem, out var stem))
+            {
+                stem.Assigned = true;
+                documentId = stem.Id;
+                matchMode = "extensionless";
+                return true;
+            }
+
             return false;
         }
 
+        public IEnumerable<ManifestFolderDocument> FindFolderDocumentIds(string? mappedPath)
+        {
+            if (string.IsNullOrWhiteSpace(mappedPath) || _folderDocuments.Count == 0)
+                return Array.Empty<ManifestFolderDocument>();
+
+            var normalizedPath = NormalizeRelativePathForMatch(mappedPath);
+            if (string.IsNullOrWhiteSpace(normalizedPath))
+                return Array.Empty<ManifestFolderDocument>();
+
+            return _folderDocuments.Where(folder =>
+                normalizedPath.Contains("/" + folder.RelativeFolderPath + "/", StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.EndsWith("/" + folder.RelativeFolderPath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalizedPath, folder.RelativeFolderPath, StringComparison.OrdinalIgnoreCase));
+        }
+
         private static bool TryTakeUnassigned(
-            Dictionary<string, Queue<ManifestDocument>> queues,
+            Dictionary<string, List<ManifestDocument>> lookups,
             string key,
             out ManifestDocument document)
         {
             document = default!;
-            if (!queues.TryGetValue(key, out var queue))
+            if (!lookups.TryGetValue(key, out var candidates))
                 return false;
 
-            while (queue.Count > 0)
+            foreach (var candidate in candidates)
             {
-                var candidate = queue.Dequeue();
                 if (candidate.Assigned)
                     continue;
 
@@ -301,17 +435,43 @@ public class CaseDocumentMetadataService
 
     private sealed class ManifestDocument
     {
-        public ManifestDocument(string id, string name, int sequence)
+        public ManifestDocument(string id, string name, string type, string category, string source, int sequence)
         {
             Id = id;
             Name = name;
+            Type = type;
+            Category = category;
+            Source = source;
             Sequence = sequence;
+            NormalizedName = NormalizeFileNameForMatch(name);
+            NormalizedStem = NormalizeFileStemForMatch(name);
+            ExpectedTypedNames = BuildExpectedTypedNames(name, type);
         }
 
         public string Id { get; }
         public string Name { get; }
+        public string Type { get; }
+        public string Category { get; }
+        public string Source { get; }
         public int Sequence { get; }
+        public string NormalizedName { get; }
+        public string NormalizedStem { get; }
+        public IReadOnlyCollection<string> ExpectedTypedNames { get; }
         public bool Assigned { get; set; }
+    }
+
+    private sealed class ManifestFolderDocument
+    {
+        public ManifestFolderDocument(string relativeFolderPath, string documentId, int sequence)
+        {
+            RelativeFolderPath = relativeFolderPath;
+            DocumentId = documentId;
+            Sequence = sequence;
+        }
+
+        public string RelativeFolderPath { get; }
+        public string DocumentId { get; }
+        public int Sequence { get; }
     }
 
     private static string NormalizeFileNameForMatch(string fileName)
@@ -321,5 +481,103 @@ public class CaseDocumentMetadataService
         normalized = normalized.Replace('\\', '/');
         normalized = CollapseWhitespaceRegex.Replace(normalized, " ").Trim().TrimEnd('.');
         return normalized.ToLowerInvariant();
+    }
+
+    private static string NormalizeFileStemForMatch(string fileName)
+    {
+        var normalizedName = NormalizeFileNameForMatch(fileName);
+        var extension = Path.GetExtension(normalizedName);
+        if (string.IsNullOrWhiteSpace(extension))
+            return normalizedName;
+
+        return normalizedName[..^extension.Length].TrimEnd('.');
+    }
+
+    private static IReadOnlyCollection<string> BuildExpectedTypedNames(string name, string type)
+    {
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var normalizedName = NormalizeFileNameForMatch(name);
+        if (!string.IsNullOrWhiteSpace(normalizedName))
+            candidates.Add(normalizedName);
+
+        var baseName = NormalizeFileStemForMatch(name);
+        if (string.IsNullOrWhiteSpace(baseName))
+            return candidates.ToList();
+
+        foreach (var extension in GetExtensionsForMimeType(type))
+            candidates.Add($"{baseName}{extension}");
+
+        return candidates.ToList();
+    }
+
+    private static bool IsFolderLikeDocument(ManifestDocument document)
+    {
+        if (!string.Equals(document.Source, "Document", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return string.Equals(document.Category, "Email", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(document.Category, "Incoming email", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(document.Category, "Incoming Email", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static ManifestFolderDocument? CreateFolderDocument(ManifestDocument document)
+    {
+        var folderName = NormalizeFolderNameForMatch(document.Name);
+        if (string.IsNullOrWhiteSpace(folderName))
+            return null;
+
+        return new ManifestFolderDocument(folderName, document.Id, document.Sequence);
+    }
+
+    private static string NormalizeFolderNameForMatch(string? folderName)
+    {
+        var normalized = NormalizeFileNameForMatch(folderName ?? string.Empty);
+        return normalized.Replace("/", "_").Trim('_', '.', ' ');
+    }
+
+    private static string NormalizeRelativePathForMatch(string? path)
+    {
+        var normalized = (path ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        var segments = normalized
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(NormalizeFolderNameForMatch)
+            .Where(s => !string.IsNullOrWhiteSpace(s));
+        return string.Join("/", segments);
+    }
+
+    private static IEnumerable<string> GetExtensionsForMimeType(string? type)
+    {
+        var normalizedType = NormalizeMimeType(type);
+        return normalizedType switch
+        {
+            "application/msword" => new[] { ".doc" },
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => new[] { ".docx" },
+            "application/pdf" => new[] { ".pdf" },
+            "application/vnd.ms-outlook" => new[] { ".msg" },
+            "message/rfc822" => new[] { ".eml" },
+            "application/vnd.ms-excel" => new[] { ".xls" },
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => new[] { ".xlsx" },
+            "application/vnd.ms-powerpoint" => new[] { ".ppt" },
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation" => new[] { ".pptx" },
+            "image/jpeg" => new[] { ".jpg", ".jpeg" },
+            "image/png" => new[] { ".png" },
+            "image/tiff" => new[] { ".tif", ".tiff" },
+            "text/plain" => new[] { ".txt" },
+            "text/rtf" => new[] { ".rtf" },
+            _ => Array.Empty<string>()
+        };
+    }
+
+    private static string NormalizeMimeType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type))
+            return string.Empty;
+
+        var semicolonIndex = type.IndexOf(';');
+        var clean = semicolonIndex >= 0 ? type[..semicolonIndex] : type;
+        return clean.Trim().ToLowerInvariant();
     }
 }
