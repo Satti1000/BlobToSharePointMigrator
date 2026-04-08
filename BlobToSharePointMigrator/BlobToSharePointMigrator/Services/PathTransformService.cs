@@ -36,47 +36,15 @@ public class PathTransformService
     {
         var normalizedBlobPath = blobPath.Replace('\\', '/').Trim('/');
 
-        if (_useYyyyCaseNumberPath)
-        {
-            var yyyyCasePath = TransformToYyyyCaseNumberPath(normalizedBlobPath);
-            if (!string.IsNullOrWhiteSpace(yyyyCasePath))
-            {
-                var safe = SanitizeSharePointRelativePath(yyyyCasePath);
-                _logger.LogDebug("Mapped (YYYY/CaseNumber): {Source} -> {Destination}", blobPath, safe);
-                return safe;
-            }
-        }
-
-        // DynamicETL-compatible fallback: compute relative path vs. BlobFolderPrefix and optionally
-        // prepend SharePointTargetFolder (without duplicating if already present).
         if (!string.IsNullOrWhiteSpace(_blobFolderPrefix) || !string.IsNullOrWhiteSpace(_sharePointTargetFolder))
         {
-            string relativePath;
-            if (string.IsNullOrWhiteSpace(_blobFolderPrefix))
-            {
-                relativePath = normalizedBlobPath;
-            }
-            else
-            {
-                relativePath = normalizedBlobPath.StartsWith(_blobFolderPrefix + "/", StringComparison.OrdinalIgnoreCase)
-                    ? normalizedBlobPath[(_blobFolderPrefix.Length + 1)..]
-                    : normalizedBlobPath;
-            }
-
-            string candidate;
-            if (!string.IsNullOrWhiteSpace(_sharePointTargetFolder))
-            {
-                candidate = relativePath.StartsWith(_sharePointTargetFolder + "/", StringComparison.OrdinalIgnoreCase)
-                    ? relativePath
-                    : $"{_sharePointTargetFolder}/{relativePath}";
-            }
-            else
-            {
-                candidate = string.IsNullOrWhiteSpace(_blobFolderPrefix)
-                    ? normalizedBlobPath
-                    : $"{_blobFolderPrefix}/{relativePath}";
-            }
-
+            // Keep this branch aligned with DynamicETL's resolver so the same
+            // source path + config produces the same SharePoint-relative path.
+            var candidate = ResolveSharePointPath(
+                normalizedBlobPath,
+                _blobFolderPrefix,
+                _sharePointTargetFolder,
+                _useYyyyCaseNumberPath);
             var safeDyn = SanitizeSharePointRelativePath(candidate);
             _logger.LogDebug("Mapped (DynamicETL fallback): {Source} -> {Destination}", blobPath, safeDyn);
             return safeDyn;
@@ -153,36 +121,62 @@ public class PathTransformService
         return $"{withoutExt}__dup{duplicateIndex}{ext}";
     }
 
+    private static string ResolveSharePointPath(string blobName, string prefix, string sharePointTargetFolder, bool useYyyyCaseNumberPath)
+    {
+        string relativePath;
+        if (string.IsNullOrEmpty(prefix))
+        {
+            relativePath = blobName;
+        }
+        else
+        {
+            relativePath = blobName.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase)
+                ? blobName[(prefix.Length + 1)..]
+                : blobName;
+        }
+
+        if (useYyyyCaseNumberPath)
+        {
+            var transformed = TransformToYyyyCaseNumberPath(blobName);
+            if (transformed != null)
+                return transformed;
+        }
+
+        if (!string.IsNullOrEmpty(sharePointTargetFolder))
+        {
+            if (relativePath.StartsWith(sharePointTargetFolder + "/", StringComparison.OrdinalIgnoreCase))
+                return relativePath;
+            return $"{sharePointTargetFolder}/{relativePath}";
+        }
+
+        return string.IsNullOrEmpty(prefix) ? blobName : $"{prefix}/{relativePath}";
+    }
+
     private static string? TransformToYyyyCaseNumberPath(string blobPath)
     {
         var segments = blobPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (segments.Length < 3)
-            return null;
+        if (segments.Length < 3) return null;
 
-        var year = segments[2];
-        if (!Regex.IsMatch(year, @"^\d{4}$"))
-            return null;
-
+        string? year = segments[2];
         string? caseNumber = null;
         var documentsIndex = -1;
+
         for (int i = 0; i < segments.Length; i++)
         {
-            var match = Regex.Match(segments[i], @"^(\d+)_Documents$", RegexOptions.IgnoreCase);
-            if (match.Success)
+            if (Regex.IsMatch(segments[i], @"^\d+_Documents$", RegexOptions.IgnoreCase))
             {
-                caseNumber = match.Groups[1].Value;
+                var match = Regex.Match(segments[i], @"^(\d+)_Documents$", RegexOptions.IgnoreCase);
+                if (match.Success)
+                    caseNumber = match.Groups[1].Value;
                 documentsIndex = i;
                 break;
             }
         }
 
-        if (documentsIndex < 0 || string.IsNullOrWhiteSpace(caseNumber))
+        if (year == null || caseNumber == null || documentsIndex < 0 || documentsIndex >= segments.Length - 1)
             return null;
 
-        var rest = documentsIndex + 1 < segments.Length
-            ? string.Join("/", segments[(documentsIndex + 1)..])
-            : string.Empty;
-
+        var rest = string.Join("/", segments[(documentsIndex + 1)..]);
         return string.IsNullOrEmpty(rest)
             ? $"{year}/{caseNumber}"
             : $"{year}/{caseNumber}/{rest}";
