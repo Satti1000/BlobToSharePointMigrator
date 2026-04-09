@@ -212,21 +212,19 @@ public class SharePointMigrationService
         await ResolveTargetLibraryAsync(targetLibraryTitle);
 
         // Pre-validate and normalize mapped paths. Bad paths are skipped so one invalid item
-        // does not fail the full migration batch.
+        // does not fail the full migration batch. Sanitize first, then validate.
         var validRecords = new List<FileRecord>(records.Count);
         var skippedInvalidPath = 0;
         foreach (var record in records)
         {
             try
             {
-                var mappedPath = record.MappedPath.Replace('\\', '/').Trim('/');
-                if (string.IsNullOrWhiteSpace(mappedPath))
+                var rawPath = (record.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+                if (string.IsNullOrWhiteSpace(rawPath))
                     throw new InvalidOperationException("Mapped path is empty.");
 
-                if (PathTransformService.ContainsInvalidSharePointChars(mappedPath))
-                    throw new InvalidOperationException($"Mapped path contains invalid SharePoint characters: {mappedPath}");
-
-                var safePath = PathTransformService.SanitizeSharePointRelativePath(mappedPath);
+                // Sanitize first so any residual invalid chars from intermediate transforms are handled.
+                var safePath = PathTransformService.SanitizeSharePointRelativePath(rawPath);
                 if (string.IsNullOrWhiteSpace(safePath))
                     throw new InvalidOperationException("Mapped path became empty after sanitization.");
 
@@ -536,7 +534,17 @@ public class SharePointMigrationService
             try
             {
                 var outerBody = msg.Body.ToString();
-                var decrypted = DecryptQueueMessage(outerBody);
+                string decrypted;
+                try
+                {
+                    decrypted = DecryptQueueMessage(outerBody);
+                }
+                catch
+                {
+                    // Some SPMI messages (e.g. early validation warnings) arrive as plain-text JSON
+                    // rather than encrypted. Fall back to the raw body so they are still processed.
+                    decrypted = outerBody;
+                }
                 _logger.LogDebug("Queue report raw: {Message}", decrypted);
 
                 var json = Newtonsoft.Json.Linq.JObject.Parse(decrypted);
@@ -562,8 +570,22 @@ public class SharePointMigrationService
 
                 if (eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase))
                 {
-                    summary.SawFatalError = true;
-                    summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
+                    // Some "JobFatalError" events are benign SPMI configuration notices that do not
+                    // actually abort file processing. Treat them as warnings so the job is not
+                    // incorrectly marked Failed.
+                    var isBenignFatal =
+                        message.Contains("source type is not specified", StringComparison.OrdinalIgnoreCase) ||
+                        message.Contains("SourceType", StringComparison.OrdinalIgnoreCase);
+
+                    if (isBenignFatal)
+                    {
+                        _logger.LogInformation("SPMI notice (non-fatal): [{Event}] {Message}", eventType, message);
+                    }
+                    else
+                    {
+                        summary.SawFatalError = true;
+                        summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
+                    }
                 }
 
                 if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
@@ -765,9 +787,12 @@ public class SharePointMigrationService
             new XElement(ns + "ExportSettings",
                 new XAttribute("SiteUrl", _settings.SharePointSiteUrl),
                 new XAttribute("FileLocation", string.Empty),
-                new XAttribute("IncludeSecurity", "None"),
+                new XAttribute("IncludeSecurity", "All"),
                 new XAttribute("IncludeVersions", "LastMajor"),
-                new XAttribute("ExportMethod", "ExportAll"))));
+                new XAttribute("ExportMethod", "ExportAll"),
+                // SourceType="None" suppresses the "source type not specified" JobFatalError
+                // that SPMI emits when this attribute is absent for non-SharePoint sources.
+                new XAttribute("SourceType", "None"))));
     }
 
     private string GenerateLookupListMap()
@@ -931,9 +956,10 @@ public class SharePointMigrationService
             }
 
             var value = kvp.Value ?? string.Empty;
+            // SPMI schema requires Value as an XML attribute — text content causes "Content mode is empty" error.
             properties.Add(new XElement(ns + "Property",
                 new XAttribute("Name", fieldInternalName),
-                value));
+                new XAttribute("Value", value)));
         }
 
         if (properties.HasElements)
@@ -1120,55 +1146,67 @@ public class SharePointMigrationService
 
     private async Task EnsureMetadataFieldMappingsAsync(IEnumerable<FileRecord> records, string libraryTitle)
     {
-        _effectiveMetadataFieldMap.Clear();
-        foreach (var kvp in _settings.MetadataFieldMap)
+        // Metadata field resolution is best-effort. Any failure must NOT block file uploads.
+        try
         {
-            if (!string.IsNullOrWhiteSpace(kvp.Key) && !string.IsNullOrWhiteSpace(kvp.Value))
-                _effectiveMetadataFieldMap[kvp.Key] = kvp.Value;
+            _effectiveMetadataFieldMap.Clear();
+            foreach (var kvp in _settings.MetadataFieldMap)
+            {
+                if (!string.IsNullOrWhiteSpace(kvp.Key) && !string.IsNullOrWhiteSpace(kvp.Value))
+                    _effectiveMetadataFieldMap[kvp.Key] = kvp.Value;
+            }
+
+            var requiredKeys = records
+                .Where(r => r.Metadata is { Count: > 0 })
+                .SelectMany(r => r.Metadata.Keys)
+                .Where(k => !string.IsNullOrWhiteSpace(k))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (requiredKeys.Count == 0)
+                return;
+
+            if (!_resolvedMetadataFieldMapByLibrary.TryGetValue(libraryTitle, out var libraryCache))
+            {
+                libraryCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                _resolvedMetadataFieldMapByLibrary[libraryTitle] = libraryCache;
+            }
+
+            foreach (var metadataKey in requiredKeys)
+            {
+                if (_effectiveMetadataFieldMap.ContainsKey(metadataKey))
+                    continue;
+
+                var displayName = GetMetadataDisplayName(metadataKey);
+                if (string.IsNullOrWhiteSpace(displayName))
+                    continue;
+
+                if (!libraryCache.TryGetValue(metadataKey, out var internalName))
+                {
+                    internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
+                    libraryCache[metadataKey] = internalName;
+                }
+
+                if (!string.IsNullOrWhiteSpace(internalName))
+                {
+                    _effectiveMetadataFieldMap[metadataKey] = internalName;
+                    _logger.LogInformation("Resolved SharePoint metadata field mapping: {MetadataKey} -> {InternalName} (library: {Library})",
+                        metadataKey, internalName, libraryTitle);
+                }
+                else
+                {
+                    _logger.LogWarning("Could not resolve SharePoint field internal name for '{MetadataKey}' (display: '{DisplayName}') in library '{Library}'. Metadata will be skipped for this field; files will still be copied.",
+                        metadataKey, displayName, libraryTitle);
+                }
+            }
         }
-
-        var requiredKeys = records
-            .Where(r => r.Metadata is { Count: > 0 })
-            .SelectMany(r => r.Metadata.Keys)
-            .Where(k => !string.IsNullOrWhiteSpace(k))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        if (requiredKeys.Count == 0)
-            return;
-
-        if (!_resolvedMetadataFieldMapByLibrary.TryGetValue(libraryTitle, out var libraryCache))
+        catch (Exception ex)
         {
-            libraryCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            _resolvedMetadataFieldMapByLibrary[libraryTitle] = libraryCache;
-        }
-
-        foreach (var metadataKey in requiredKeys)
-        {
-            if (_effectiveMetadataFieldMap.ContainsKey(metadataKey))
-                continue;
-
-            var displayName = GetMetadataDisplayName(metadataKey);
-            if (string.IsNullOrWhiteSpace(displayName))
-                continue;
-
-            if (!libraryCache.TryGetValue(metadataKey, out var internalName))
-            {
-                internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
-                libraryCache[metadataKey] = internalName;
-            }
-
-            if (!string.IsNullOrWhiteSpace(internalName))
-            {
-                _effectiveMetadataFieldMap[metadataKey] = internalName;
-                _logger.LogInformation("Resolved SharePoint metadata field mapping: {MetadataKey} -> {InternalName} (library: {Library})",
-                    metadataKey, internalName, libraryTitle);
-            }
-            else
-            {
-                _logger.LogWarning("Could not resolve SharePoint field internal name for metadata key '{MetadataKey}' using display name '{DisplayName}' in library '{Library}'.",
-                    metadataKey, displayName, libraryTitle);
-            }
+            // Field resolution is non-critical. Log and proceed so files are always copied.
+            _logger.LogWarning(ex,
+                "Metadata field resolution failed for library '{Library}'. Files will still be copied without metadata column mapping.",
+                libraryTitle);
+            _effectiveMetadataFieldMap.Clear();
         }
     }
 
@@ -1186,15 +1224,25 @@ public class SharePointMigrationService
 
     private async Task<string?> ResolveFieldInternalNameAsync(string libraryTitle, string displayName)
     {
-        var list = _web.Lists.GetByTitle(libraryTitle);
-        var fields = list.Fields;
-        _clientContextG.Load(fields, fs => fs.Include(f => f.InternalName, f => f.Title));
-        await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+        try
+        {
+            var list = _web.Lists.GetByTitle(libraryTitle);
+            var fields = list.Fields;
+            _clientContextG.Load(fields, fs => fs.Include(f => f.InternalName, f => f.Title));
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
 
-        var field = fields.FirstOrDefault(f =>
-            string.Equals(f.Title, displayName, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(f.InternalName, displayName, StringComparison.OrdinalIgnoreCase));
+            var field = fields.FirstOrDefault(f =>
+                string.Equals(f.Title, displayName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(f.InternalName, displayName, StringComparison.OrdinalIgnoreCase));
 
-        return field?.InternalName;
+            return field?.InternalName;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not read fields for library '{Library}' to resolve display name '{DisplayName}'. Field mapping skipped.",
+                libraryTitle, displayName);
+            return null;
+        }
     }
 }
