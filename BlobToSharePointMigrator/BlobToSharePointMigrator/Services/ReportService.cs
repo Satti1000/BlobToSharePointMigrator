@@ -108,38 +108,30 @@ public class ReportService
         var partial  = results.Count(r => r.Status == "PartialSuccess");
         var failed   = results.Count(r => r.Status == "Failed");
 
-        // Elaborate run summary (styled after Application No.1)
-        Console.WriteLine();
-        Console.WriteLine("========== BlobToSharePointSync run summary ==========");
-        if (blobsListed > 0) Console.WriteLine($"Blobs listed (container/prefix): {blobsListed}");
-        Console.WriteLine($"Skipped (invalid/filtered): {skipped.Count}");
-        Console.WriteLine($"Skipped (already exists in target): {alreadyExistsConflicts}");
-        if (filesPlannedToMigrate > 0) Console.WriteLine($"Files planned to migrate: {filesPlannedToMigrate}");
-        Console.WriteLine($"Files uploaded successfully: {success + partial}");
-        Console.WriteLine($"Failed uploads: {failed}");
-        if (estimatedCaseFolders > 0) Console.WriteLine($"Case-number folders patched: {estimatedCaseFolders}");
-        Console.WriteLine($"Other errors (non-existence): {otherErrorConflicts}");
-        Console.WriteLine("======================================================");
-        Console.WriteLine($"Report saved: {_settings.ReportFile}");
-        Console.WriteLine($"Failed-items file: {_settings.FailedItemsFile}");
-        Console.WriteLine("======================================================");
-        Console.WriteLine();
+        // Build summary block styled after Application 1.
+        // Logged via _logger (appears in log files) AND Console.WriteLine (appears in terminal).
+        var lines = new System.Text.StringBuilder();
+        lines.AppendLine();
+        lines.AppendLine("========== BlobToSharePointSync run summary ==========");
+        if (blobsListed > 0)            lines.AppendLine($"  Blobs listed (container/prefix):     {blobsListed}");
+        lines.AppendLine($"  Skipped (invalid/filtered):          {skipped.Count}");
+        lines.AppendLine($"  Skipped (already exists in target):  {alreadyExistsConflicts}");
+        if (filesPlannedToMigrate > 0) lines.AppendLine($"  Files planned to migrate:            {filesPlannedToMigrate}");
+        lines.AppendLine($"  Files uploaded successfully:         {success + partial}");
+        lines.AppendLine($"  Failed uploads:                      {failed}");
+        if (estimatedCaseFolders > 0)  lines.AppendLine($"  Case-number folders patched:         {estimatedCaseFolders}");
+        lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");
+        lines.AppendLine("======================================================");
+        lines.AppendLine($"  Report saved:      {_settings.ReportFile}");
+        lines.AppendLine($"  Failed-items file: {_settings.FailedItemsFile}");
+        lines.Append    ("======================================================");
 
-        if (results.Any())
-        {
-            Console.WriteLine($"{"Source File",-35} {"Destination",-40} {"Status",-10} {"Size",10}");
-            Console.WriteLine(new string('-', 100));
-            foreach (var r in results)
-                Console.WriteLine($"{r.SourceFile,-35} {r.DestPath,-40} {r.Status,-10} {r.SizeBytes,10}");
-        }
-
-        if (failed > 0)
-        {
-            Console.WriteLine();
-            Console.WriteLine("Failures:");
-            foreach (var r in results.Where(r => r.Status == "Failed"))
-                Console.WriteLine($"  - {r.SourceFile}: {r.Error}");
-        }
+        var summary = lines.ToString();
+        // Write to both console (visible in terminal) and logger (visible in log files/sinks).
+        Console.WriteLine(summary);
+        _logger.LogInformation("{Summary}", summary);
+        // Per-file detail is already captured in the CSV report files; omit it here to keep
+        // console output clean and prevent 10k+ lines from burying the summary.
     }
 
     private sealed class FailedItemRow

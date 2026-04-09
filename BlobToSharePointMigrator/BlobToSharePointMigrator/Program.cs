@@ -58,7 +58,9 @@ var transformSvc = new PathTransformService(
     migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
-var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
+// CaseDocumentMetadataService is instantiated here for future use in the metadata branch.
+// It is not called in this branch — EnrichAsync and bulk CSOM patch are both disabled below.
+// var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
@@ -170,8 +172,11 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    logger.LogInformation("STEP 2.5/5 - Enriching metadata from case XML...");
-    await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
+    // STEP 2.5 — XML metadata enrichment (CaseId/CaseType/DocumentId) is intentionally
+    // disabled in this branch. Priority is reliable file transfer first; metadata will be
+    // re-enabled in the next branch once file copy is confirmed working.
+    // await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
+    logger.LogInformation("STEP 2.5/5 - Metadata enrichment skipped (deferred to metadata branch).");
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -342,7 +347,8 @@ try
                     var finalJobInfo = await batchSpService.PollMigrationJobAsync(
                         jobInfo.JobId,
                         TimeSpan.FromMinutes(timeoutMinutes),
-                        pollIntervalSeconds * 1000);
+                        pollIntervalSeconds * 1000,
+                        batch.Count);
                     await batchSpService.CleanupStagingContainersAsync();
                     Interlocked.Add(ref aggregateAlreadyExists, finalJobInfo.AlreadyExistsCount);
                     Interlocked.Add(ref aggregateOtherErrors, finalJobInfo.OtherErrorCount);
@@ -440,6 +446,12 @@ try
 
         await Task.WhenAll(tasks);
     }
+
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType) ──────────────────────────────────
+    // Disabled in this branch — priority is reliable file transfer first.
+    // PatchCaseMetadataBulkAsync is implemented in SharePointMigrationService and ready to use;
+    // it will be re-enabled in the next branch once file copy success is confirmed.
+    logger.LogInformation("STEP 5/5 - Metadata patch deferred (will be enabled in metadata branch).");
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
