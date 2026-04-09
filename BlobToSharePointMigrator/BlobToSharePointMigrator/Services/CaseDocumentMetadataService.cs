@@ -487,10 +487,26 @@ public class CaseDocumentMetadataService
     {
         var normalizedName = NormalizeFileNameForMatch(fileName);
         var extension = Path.GetExtension(normalizedName);
-        if (string.IsNullOrWhiteSpace(extension))
+
+        // Only strip if the extension looks like a real file extension.
+        // Purely numeric suffixes like .20, .2, .0 are version numbers, not extensions,
+        // and must not be stripped (e.g. "document v.20" → stem should stay "document v.20").
+        if (string.IsNullOrWhiteSpace(extension) || !IsRealFileExtension(extension))
             return normalizedName;
 
         return normalizedName[..^extension.Length].TrimEnd('.');
+    }
+
+    private static bool IsRealFileExtension(string extension)
+    {
+        // Expect: starts with '.', followed by 1–6 alphanumeric chars, NOT purely digits.
+        var ext = extension.TrimStart('.');
+        if (ext.Length == 0 || ext.Length > 6)
+            return false;
+        if (!ext.All(char.IsLetterOrDigit))
+            return false;
+        // Purely numeric = version number (.20, .2, .0 …), not a file extension.
+        return !ext.All(char.IsDigit);
     }
 
     private static IReadOnlyCollection<string> BuildExpectedTypedNames(string name, string type)
