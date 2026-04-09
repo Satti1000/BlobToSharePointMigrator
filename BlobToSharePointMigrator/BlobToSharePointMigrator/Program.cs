@@ -86,6 +86,19 @@ static void ValidateStartupSettings(MigrationSettings migrationSettings)
         throw new InvalidOperationException("Startup settings validation failed:\n - " + string.Join("\n - ", errors));
 }
 
+// Strips "YYYY/" library prefix from a mapped path so DestPath/SharePointUrl
+// in the report reflects the path-within-library, not the full YYYY/case/file path.
+static string StripLibraryPrefix(string mappedPath, string libraryPrefix)
+{
+    if (string.IsNullOrWhiteSpace(libraryPrefix))
+        return mappedPath;
+    var normalized = (mappedPath ?? string.Empty).Replace('\\', '/');
+    var prefix = libraryPrefix.Trim('/') + "/";
+    return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+        ? normalized[prefix.Length..]
+        : normalized;
+}
+
 try
 {
     logger.LogInformation("Running startup configuration precheck...");
@@ -355,14 +368,18 @@ try
                                     ? "PartialSuccess"
                                     : "Failed";
 
+                        // Strip leading "YYYY/" from DestPath/SharePointUrl when YearAsLibrary is active
+                        // so the report shows the correct path-within-library (no double year).
+                        var destPath = StripLibraryPrefix(record.MappedPath, targetLibrary);
+
                         var result = new BlobToSharePointMigrator.Models.MigrationResult
                         {
                             SourceFile = record.BlobPath,
-                            DestPath = record.MappedPath,
+                            DestPath = destPath,
                             SizeBytes = record.SizeBytes,
                             LastModified = record.LastModified,
                             Status = rowStatus,
-                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{targetLibrary}/{record.MappedPath}",
+                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{targetLibrary}/{destPath}",
                             Error = rowStatus == "Failed" ? firstError : string.Empty,
                             Duration = "N/A (batch operation)"
                         };
@@ -392,14 +409,18 @@ try
 
                     foreach (var record in batch)
                     {
+                        var catchLibrary = migrationSettings.YearAsLibrary
+                            ? (record.MappedPath.Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty)
+                            : migrationSettings.SharePointDocumentLibrary;
+                        var catchDestPath = StripLibraryPrefix(record.MappedPath, catchLibrary);
                         var failed = new BlobToSharePointMigrator.Models.MigrationResult
                         {
                             SourceFile = record.BlobPath,
-                            DestPath = record.MappedPath,
+                            DestPath = catchDestPath,
                             SizeBytes = record.SizeBytes,
                             LastModified = record.LastModified,
                             Status = "Failed",
-                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{(migrationSettings.YearAsLibrary ? (record.MappedPath.Replace('\\','/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty) : migrationSettings.SharePointDocumentLibrary)}/{record.MappedPath}",
+                            SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{catchLibrary}/{catchDestPath}",
                             Error = ex.Message,
                             Duration = "N/A (batch operation)"
                         };
