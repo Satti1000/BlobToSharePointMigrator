@@ -343,8 +343,12 @@ public class CaseDocumentMetadataService
                     g => g.Select(x => x.Document).OrderBy(x => x.Sequence).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
+            // Key the stem lookup by the XML entry's NormalizedName (never strip extensions from XML names —
+            // XML entries do not have extensions). The blob-side lookup strips only real file extensions
+            // from the blob filename (e.g. .doc/.pdf), so the stem matches the XML Name correctly.
+            // e.g. XML "Acknowledgement letter v2.0" matches blob "Acknowledgement letter v2.0.doc".
             var stems = fileEntries
-                .GroupBy(x => x.NormalizedStem, StringComparer.OrdinalIgnoreCase)
+                .GroupBy(x => x.NormalizedName, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
                     g => g.OrderBy(x => x.Sequence).ToList(),
