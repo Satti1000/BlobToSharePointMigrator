@@ -60,7 +60,7 @@ var spServiceProbe = new SharePointMigrationService(settings, migrationSettings,
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 // CaseDocumentMetadataService is instantiated here for future use in the metadata branch.
 // It is not called in this branch — EnrichAsync and bulk CSOM patch are both disabled below.
-// var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
+var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
@@ -175,7 +175,7 @@ try
     // STEP 2.5 — XML metadata enrichment (CaseId/CaseType/DocumentId) is intentionally
     // disabled in this branch. Priority is reliable file transfer first; metadata will be
     // re-enabled in the next branch once file copy is confirmed working.
-    // await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
+    await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
     logger.LogInformation("STEP 2.5/5 - Metadata enrichment skipped (deferred to metadata branch).");
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.

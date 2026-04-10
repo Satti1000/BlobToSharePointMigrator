@@ -111,7 +111,8 @@ public class BlobInventoryService
 
     private static string? TryGetYearCaseTypeKey(string blobPath)
     {
-        var yearMatch = Regex.Match(blobPath, @"(?<!\d)(20\d{2})(?!\d)", RegexOptions.IgnoreCase);
+        var regex = "(?<=\\/)(\\d{4})(?=\\/)";
+        var yearMatch = Regex.Match(blobPath, @regex, RegexOptions.IgnoreCase);
         if (!yearMatch.Success)
             return null;
 

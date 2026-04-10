@@ -806,10 +806,8 @@ public class SharePointMigrationService
                 new XAttribute("FileLocation", string.Empty),
                 new XAttribute("IncludeSecurity", "All"),
                 new XAttribute("IncludeVersions", "LastMajor"),
-                new XAttribute("ExportMethod", "ExportAll"),
-                // SourceType="None" suppresses the "source type not specified" JobFatalError
-                // that SPMI emits when this attribute is absent for non-SharePoint sources.
-                new XAttribute("SourceType", "None"))));
+                new XAttribute("ExportMethod", "ExportAll")
+                )));
     }
 
     private string GenerateLookupListMap()
