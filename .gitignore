@@ -1,7 +1,34 @@
-﻿################################################################################
-# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
-################################################################################
+# Build output — all configurations
+**/bin/
+**/obj/
 
-/BlobToSharePointMigrator/bin/Debug/net8.0
-/BlobToSharePointMigrator/obj
-/.vs/BlobToSharePointMigratorSatti/v17
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+
+# Publish output
+publish/
+out/
+
+# Logs and runtime reports
+logs/
+*.log
+migration-report.csv
+failed-files.csv
+
+# Secrets — never commit
+appsettings.local.json
+appsettings.*.local.json
+*.pfx
+*.p12
+secrets.json
+
+# OS artefacts
+Thumbs.db
+.DS_Store
