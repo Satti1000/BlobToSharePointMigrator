@@ -1,11 +1,5 @@
 {
   "folderMappings": [
-    { "source": "hr/contracts",     "destination": "HR/Employment-Contracts" },
-    { "source": "hr/policies",      "destination": "HR/Policies" },
-    { "source": "finance/invoices", "destination": "Finance/Invoices" },
-    { "source": "finance/reports",  "destination": "Finance/Reports" },
-    { "source": "legal/agreements", "destination": "Legal/Agreements" },
-    { "source": "it/docs",          "destination": "IT/Documentation" },
     { "source": "",                 "destination": "General" }
   ]
 }

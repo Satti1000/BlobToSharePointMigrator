@@ -20,9 +20,10 @@ public class PathTransformService
 
     public string Transform(string blobPath)
     {
-        var fileName  = Path.GetFileName(blobPath);
-        var directory = blobPath.Contains('/')
-            ? blobPath[..blobPath.LastIndexOf('/')]
+        var normalizedBlobPath = blobPath.Replace('\\', '/').Trim('/');
+        var fileName  = Path.GetFileName(normalizedBlobPath);
+        var directory = normalizedBlobPath.Contains('/')
+            ? normalizedBlobPath[..normalizedBlobPath.LastIndexOf('/')]
             : string.Empty;
 
         // Find best matching mapping (longest match wins)
@@ -40,15 +41,53 @@ public class PathTransformService
         bestMatch ??= _mappingConfig.FolderMappings.FirstOrDefault(m => m.Source == string.Empty)
             ?? new FolderMapping { Source = string.Empty, Destination = "General" };
 
-        var mappedPath = $"{bestMatch.Destination}/{fileName}";
+        var sourcePrefix = (bestMatch.Source ?? string.Empty).Replace('\\', '/').Trim('/');
+        var destinationRoot = (bestMatch.Destination ?? "General").Replace('\\', '/').Trim('/');
+
+        // Preserve relative subfolders under the matched source to avoid filename collisions
+        // when many files share the same basename (e.g. case_details_*.xml).
+        var relativeDir = directory;
+        if (!string.IsNullOrEmpty(sourcePrefix) &&
+            relativeDir.StartsWith(sourcePrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            relativeDir = relativeDir[sourcePrefix.Length..].Trim('/');
+        }
+
+        var mappedPath = string.IsNullOrEmpty(relativeDir)
+            ? $"{destinationRoot}/{fileName}"
+            : $"{destinationRoot}/{relativeDir}/{fileName}";
+
         _logger.LogDebug("Mapped: {Source} -> {Destination}", blobPath, mappedPath);
         return mappedPath;
     }
 
     public List<FileRecord> TransformAll(List<FileRecord> records)
     {
+        var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var record in records.Where(r => r.IsAllowed))
-            record.MappedPath = Transform(record.BlobPath);
+        {
+            var mapped = Transform(record.BlobPath);
+            if (seen.TryGetValue(mapped, out var count))
+            {
+                count++;
+                seen[mapped] = count;
+                mapped = AppendDuplicateSuffix(mapped, count);
+                _logger.LogWarning("Duplicate mapped path detected. Adjusted to: {MappedPath}", mapped);
+            }
+            else
+            {
+                seen[mapped] = 0;
+            }
+
+            record.MappedPath = mapped;
+        }
         return records;
+    }
+
+    private static string AppendDuplicateSuffix(string mappedPath, int duplicateIndex)
+    {
+        var ext = Path.GetExtension(mappedPath);
+        var withoutExt = mappedPath[..^ext.Length];
+        return $"{withoutExt}__dup{duplicateIndex}{ext}";
     }
 }

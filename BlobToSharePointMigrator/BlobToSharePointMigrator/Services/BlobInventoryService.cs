@@ -30,6 +30,7 @@ public class BlobInventoryService
         _logger.LogInformation("Inventorying container: {Container}", _settings.SourceContainer);
 
         var records = new List<FileRecord>();
+        var allowedExtensions = new HashSet<string>(_settings.AllowedExtensions, StringComparer.OrdinalIgnoreCase);
         var blobFolderPrefix = _processFlags.GetSection("BlobFolderPrefix").Value;
         var prefix = blobFolderPrefix?.TrimEnd('/') ?? "";
         var listPrefix = string.IsNullOrEmpty(prefix) ? "" : prefix + "/";
@@ -37,7 +38,7 @@ public class BlobInventoryService
         await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: listPrefix)) //BlobTraits.Metadata | BlobTraits.Tags))
         {
             var ext = Path.GetExtension(blob.Name).ToLower();
-            var allowed = _settings.AllowedExtensions.Contains(ext);
+            var allowed = allowedExtensions.Contains(ext);
             var skipReason = allowed ? string.Empty : $"Extension '{ext}' not in allowed list";
 
             var record = new FileRecord

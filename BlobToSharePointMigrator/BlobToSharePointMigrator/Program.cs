@@ -18,12 +18,18 @@ var config = new ConfigurationBuilder()
     .AddEnvironmentVariables()
     .Build();
 
-var settings = config.GetSection("SimpleETL") 
-    ?? throw new InvalidOperationException("settings not found in appsettings.json");
+var migrationSection = config.GetSection("Migration");
+if (!migrationSection.Exists())
+    migrationSection = config.GetSection("SimpleETL");
+if (!migrationSection.Exists())
+    throw new InvalidOperationException("Neither 'Migration' nor 'SimpleETL' section was found in appsettings.json");
 
+var settings = config.GetSection("SimpleETL");
+if (!settings.Exists())
+    settings = migrationSection;
 
-var migrationSettings = config.GetSection("SimpleETL").Get<MigrationSettings>()
-    ?? throw new InvalidOperationException("Migration settings not found in appsettings.json");
+var migrationSettings = migrationSection.Get<MigrationSettings>()
+    ?? throw new InvalidOperationException("Migration settings could not be bound from 'Migration' or 'SimpleETL' section.");
 
 
 // ── Dependency Injection ─────────────────────────────────
@@ -64,6 +70,12 @@ try
 
     // Apply delta filtering
     var toMigrate = allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
+    if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
+    {
+        toMigrate = toMigrate.Take(migrationSettings.MaxFilesToMigrate).ToList();
+        logger.LogInformation("Milestone cap active: limiting run to first {Limit} files.", migrationSettings.MaxFilesToMigrate);
+    }
+
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
     if (toMigrate.Count == 0)
@@ -89,7 +101,12 @@ try
 
     // ── Step 6: Poll for completion ──────────────────────
     logger.LogInformation("STEP 5/5 — Polling migration job status (this may take several minutes for large batches)...");
-    var finalJobInfo = await spService.PollMigrationJobAsync(jobInfo.JobId);
+    var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
+    var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
+    var finalJobInfo = await spService.PollMigrationJobAsync(
+        jobInfo.JobId,
+        TimeSpan.FromMinutes(timeoutMinutes),
+        pollIntervalSeconds * 1000);
 
     // ── Step 6b: Cleanup staging containers ──────────────
     await spService.CleanupStagingContainersAsync();
@@ -97,17 +114,36 @@ try
     // Build results from job status
      
     var results = new List<BlobToSharePointMigrator.Models.MigrationResult>();
+    var markAllFailed = finalJobInfo.Status == "Failed" ||
+                        (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
+    var firstError = finalJobInfo.Errors
+        .FirstOrDefault(e =>
+            e.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("Fatal", StringComparison.OrdinalIgnoreCase) ||
+            e.Contains("not found", StringComparison.OrdinalIgnoreCase))
+        ?? finalJobInfo.Errors.FirstOrDefault()
+        ?? string.Empty;
+
     foreach (var record in toMigrate)
     {
+        var rowStatus = markAllFailed
+            ? "Failed"
+            : finalJobInfo.Status == "Completed"
+                ? "Success"
+                : finalJobInfo.Status == "CompletedWithErrors"
+                    ? "PartialSuccess"
+                    : "Failed";
+
         var result = new BlobToSharePointMigrator.Models.MigrationResult
         {
             SourceFile = record.BlobPath,
             DestPath = record.MappedPath,
             SizeBytes = record.SizeBytes,
             LastModified = record.LastModified,
-            Status = finalJobInfo.Status == "Completed" ? "Success" :
-                     finalJobInfo.Status == "CompletedWithErrors" ? "PartialSuccess" : "Failed",
+            Status = rowStatus,
             SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{migrationSettings.SharePointDocumentLibrary}/{record.MappedPath}",
+            Error = rowStatus == "Failed" ? firstError : string.Empty,
             Duration = "N/A (batch operation)"
         };
         results.Add(result);
@@ -130,7 +166,8 @@ try
 }
 catch (Exception ex)
 {
-    logger.LogCritical("Pipeline failed: {Error}", ex.Message);
+    logger.LogCritical(ex, "Pipeline failed.");
     Console.WriteLine($"\n✗ Fatal error: {ex.Message}");
+    Console.WriteLine(ex.ToString());
     Environment.Exit(1);
 }

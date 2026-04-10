@@ -60,6 +60,7 @@ public class ReportService
     public void PrintSummary(List<MigrationResult> results, List<FileRecord> skipped)
     {
         var success  = results.Count(r => r.Status == "Success");
+        var partial  = results.Count(r => r.Status == "PartialSuccess");
         var failed   = results.Count(r => r.Status == "Failed");
 
         Console.WriteLine();
@@ -67,6 +68,7 @@ public class ReportService
         Console.WriteLine("   MIGRATION COMPLETE");
         Console.WriteLine("═══════════════════════════════════════════════════");
         Console.WriteLine($"   Succeeded  : {success}");
+        Console.WriteLine($"   Partial    : {partial}");
         Console.WriteLine($"   Failed     : {failed}");
         Console.WriteLine($"   Skipped    : {skipped.Count}");
         Console.WriteLine($"   Report     : {_settings.ReportFile}");
