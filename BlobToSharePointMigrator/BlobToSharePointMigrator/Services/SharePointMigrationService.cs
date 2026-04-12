@@ -862,8 +862,8 @@ public class SharePointMigrationService
                 new XAttribute("FileLocation", string.Empty),
                 new XAttribute("IncludeSecurity", "All"),
                 new XAttribute("IncludeVersions", "LastMajor"),
-                new XAttribute("ExportMethod", "ExportAll"),
-                new XAttribute("SourceType", "None"))));
+                new XAttribute("ExportMethod", "ExportAll")
+                )));
     }
 
     private string GenerateLookupListMap()
