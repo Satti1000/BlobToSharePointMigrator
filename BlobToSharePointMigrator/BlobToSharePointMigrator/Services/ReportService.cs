@@ -102,7 +102,8 @@ public class ReportService
         int blobsListed = 0,
         int filesPlannedToMigrate = 0,
         int estimatedCaseFolders = 0,
-        int otherErrorConflicts = 0)
+        int otherErrorConflicts = 0,
+        bool reportExistingFilesAsOverwritten = false)
     {
         var success  = results.Count(r => r.Status == "Success");
         var partial  = results.Count(r => r.Status == "PartialSuccess");
@@ -115,7 +116,10 @@ public class ReportService
         lines.AppendLine("========== BlobToSharePointSync run summary ==========");
         if (blobsListed > 0)            lines.AppendLine($"  Blobs listed (container/prefix):     {blobsListed}");
         lines.AppendLine($"  Skipped (invalid/filtered):          {skipped.Count}");
-        lines.AppendLine($"  Skipped (already exists in target):  {alreadyExistsConflicts}");
+        if (reportExistingFilesAsOverwritten && alreadyExistsConflicts > 0)
+            lines.AppendLine($"  Already exists (reported as overwritten): {alreadyExistsConflicts}");
+        else
+            lines.AppendLine($"  Skipped (already exists in target):       {alreadyExistsConflicts}");
         if (filesPlannedToMigrate > 0) lines.AppendLine($"  Files planned to migrate:            {filesPlannedToMigrate}");
         lines.AppendLine($"  Files uploaded successfully:         {success + partial}");
         lines.AppendLine($"  Failed uploads:                      {failed}");

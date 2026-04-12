@@ -58,8 +58,6 @@ var transformSvc = new PathTransformService(
     migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
-// CaseDocumentMetadataService is instantiated here for future use in the metadata branch.
-// It is not called in this branch — EnrichAsync and bulk CSOM patch are both disabled below.
 var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
@@ -172,11 +170,8 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    // STEP 2.5 — XML metadata enrichment (CaseId/CaseType/DocumentId) is intentionally
-    // disabled in this branch. Priority is reliable file transfer first; metadata will be
-    // re-enabled in the next branch once file copy is confirmed working.
+    logger.LogInformation("STEP 2.5/5 - Enriching CaseId and CaseType from blob paths...");
     await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
-    logger.LogInformation("STEP 2.5/5 - Metadata enrichment skipped (deferred to metadata branch).");
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -202,7 +197,7 @@ try
     {
         logger.LogInformation("No files to migrate (all already migrated or filtered)");
         reportSvc.SaveDeltaTracking();
-        reportSvc.PrintSummary(new List<BlobToSharePointMigrator.Models.MigrationResult>(), skipped, 0, records.Count, toMigrate.Count);
+        reportSvc.PrintSummary(new List<BlobToSharePointMigrator.Models.MigrationResult>(), skipped, 0, records.Count, toMigrate.Count, 0, 0, migrationSettings.ReportExistingFilesAsOverwritten);
         Environment.Exit(0);
     }
 
@@ -291,7 +286,6 @@ try
                     var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
                     var caseIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseId", out var value) && !string.IsNullOrWhiteSpace(value));
                     var caseTypeAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseType", out var value) && !string.IsNullOrWhiteSpace(value));
-                    var documentIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("DocumentId", out var value) && !string.IsNullOrWhiteSpace(value));
 
                     // Determine target library for this batch
                     string targetLibrary = migrationSettings.YearAsLibrary
@@ -300,14 +294,13 @@ try
                         : migrationSettings.SharePointDocumentLibrary;
 
                     logger.LogInformation(
-                        "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount}, DocumentId={DocumentIdCount} — sample file: {File} — library: {Library}",
+                        "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount} — sample file: {File} — library: {Library}",
                         index + 1,
                         batchesToRun.Count,
                         batch.Count,
                         caseLabel,
                         caseIdAssignedCount,
                         caseTypeAssignedCount,
-                        documentIdAssignedCount,
                         sampleFile,
                         targetLibrary);
                     // Use isolated service/context per concurrent batch to avoid shared-state contention.
@@ -353,6 +346,9 @@ try
                     Interlocked.Add(ref aggregateAlreadyExists, finalJobInfo.AlreadyExistsCount);
                     Interlocked.Add(ref aggregateOtherErrors, finalJobInfo.OtherErrorCount);
 
+                    // Batch failure: trust SPMI queue summary. Destination-already-present cases are
+                    // classified as non-fatal in SharePointMigrationService (JobFatalError + conflict text)
+                    // so Status should not be Failed for those re-runs.
                     var markAllFailed = finalJobInfo.Status == "Failed" ||
                                         (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
                     var firstError = finalJobInfo.Errors
@@ -447,11 +443,46 @@ try
         await Task.WhenAll(tasks);
     }
 
-    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType) ──────────────────────────────────
-    // Disabled in this branch — priority is reliable file transfer first.
-    // PatchCaseMetadataBulkAsync is implemented in SharePointMigrationService and ready to use;
-    // it will be re-enabled in the next branch once file copy success is confirmed.
-    logger.LogInformation("STEP 5/5 - Metadata patch deferred (will be enabled in metadata branch).");
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType) ───────────────────────────────────
+    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType)...");
+    {
+        var successBlobPaths = new HashSet<string>(allResults
+            .Where(r => r.Status is "Success" or "PartialSuccess")
+            .Select(r => r.SourceFile), StringComparer.OrdinalIgnoreCase);
+        var metaRecords = toMigrate.Where(r => successBlobPaths.Contains(r.BlobPath)).ToList();
+
+        if (metaRecords.Count == 0)
+        {
+            logger.LogInformation("STEP 5/5 - No successful uploads to patch.");
+        }
+        else
+        {
+            var metaService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+            await metaService.ConnectAsync();
+
+            if (migrationSettings.YearAsLibrary)
+            {
+                foreach (var g in metaRecords.GroupBy(r =>
+                {
+                    var segs = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/')
+                        .Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    return segs.Length > 0 && Regex.IsMatch(segs[0], @"^\d{4}$") ? segs[0] : string.Empty;
+                }, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrEmpty(g.Key)) continue;
+                    var patched = await metaService.PatchCaseMetadataBulkAsync(g.ToList(), g.Key, g.Key);
+                    logger.LogInformation("STEP 5/5 - Library {Library}: patched {Count} list items.", g.Key, patched);
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
+            {
+                var patched = await metaService.PatchCaseMetadataBulkAsync(
+                    metaRecords, migrationSettings.SharePointDocumentLibrary, yearPrefixToStrip: null);
+                logger.LogInformation("STEP 5/5 - Library {Library}: patched {Count} list items.",
+                    migrationSettings.SharePointDocumentLibrary, patched);
+            }
+        }
+    }
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
@@ -470,7 +501,15 @@ try
         }
         estimatedCaseFolders = cf.Count;
     }
-    reportSvc.PrintSummary(allResults, skipped, aggregateAlreadyExists, records.Count, toMigrate.Count, estimatedCaseFolders, aggregateOtherErrors);
+    reportSvc.PrintSummary(
+        allResults,
+        skipped,
+        aggregateAlreadyExists,
+        records.Count,
+        toMigrate.Count,
+        estimatedCaseFolders,
+        aggregateOtherErrors,
+        migrationSettings.ReportExistingFilesAsOverwritten);
 
     logger.LogInformation(string.Empty);
     logger.LogInformation("Migration complete! Submitted jobs: {Jobs}, Total files: {Total}", batchesToRun.Count, toMigrate.Count);

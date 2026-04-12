@@ -33,4 +33,10 @@ public class MigrationSettings
     public string FailedItemsFile           { get; set; } = "failed-files.csv";
     public bool RetryFailedOnly             { get; set; } = false;
     public bool RetryIncludeAlreadyExists   { get; set; } = false;
+
+    /// <summary>
+    /// When true, SPMI queue messages containing "already exists" are logged and summarized as
+    /// overwrite/replace intent (client wording: "already exists and overwritten").
+    /// </summary>
+    public bool ReportExistingFilesAsOverwritten { get; set; } = true;
 }

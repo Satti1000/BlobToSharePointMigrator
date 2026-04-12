@@ -1,6 +1,7 @@
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Queues;
+using Azure.Storage.Queues.Models;
 using BlobToSharePointMigrator.Configuration;
 using BlobToSharePointMigrator.Models;
 using Microsoft.Extensions.Configuration;
@@ -11,6 +12,7 @@ using PnP.Framework;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Net;
+using System.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
 
@@ -524,7 +526,8 @@ public class SharePointMigrationService
     // Queue reporting
 
     /// <summary>
-    /// Reads migration job report messages from the Azure Queue to get actual success/failure details.
+    /// Reads SPMI queue messages until empty or a final event for this job is seen. Large jobs emit
+    /// many JobProgress rows; a single 32-message receive without delete can hide JobEnd.
     /// </summary>
     private async Task<QueueSummary> ReadQueueReportAsync(Guid jobId)
     {
@@ -534,142 +537,153 @@ public class SharePointMigrationService
             return summary;
 
         var queueClient = new QueueClient(new Uri(_queueUri));
-        Azure.Response<Azure.Storage.Queues.Models.QueueMessage[]> messages;
-        try
-        {
-            messages = await queueClient.ReceiveMessagesAsync(maxMessages: 32);
-        }
-        catch (Exception ex) when (IsTransientRequestError(ex))
-        {
-            _logger.LogWarning(ex, "Transient queue-read error while checking job {JobId}.", jobId);
-            return summary;
-        }
+        var receiveVisibility = TimeSpan.FromMinutes(5);
+        const int maxRounds = 500;
 
-        foreach (var msg in messages.Value)
+        for (var round = 0; round < maxRounds && !summary.SawFinalEvent; round++)
         {
+            Azure.Response<QueueMessage[]> response;
             try
             {
-                var outerBody = msg.Body.ToString();
-                string decrypted;
+                response = await queueClient.ReceiveMessagesAsync(maxMessages: 32, visibilityTimeout: receiveVisibility)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientRequestError(ex))
+            {
+                _logger.LogWarning(ex, "Transient queue-read error while checking job {JobId}.", jobId);
+                return summary;
+            }
+
+            if (response.Value == null || response.Value.Length == 0)
+                break;
+
+            foreach (var msg in response.Value)
+            {
                 try
                 {
-                    decrypted = DecryptQueueMessage(outerBody);
-                }
-                catch
-                {
-                    // Some SPMI messages (e.g. early validation warnings) arrive as plain-text JSON
-                    // rather than encrypted. Fall back to the raw body so they are still processed.
-                    decrypted = outerBody;
-                }
-                _logger.LogDebug("Queue report raw: {Message}", decrypted);
-
-                var json = Newtonsoft.Json.Linq.JObject.Parse(decrypted);
-                var eventType = json["Event"]?.ToString() ?? "";
-                var message = json["Message"]?.ToString()
-                           ?? json["ErrorMessage"]?.ToString() ?? "";
-                var jobIdInMessage = json["JobId"]?.ToString();
-
-                // Best-effort filter to only process messages for our job.
-                if (!string.IsNullOrWhiteSpace(jobIdInMessage) &&
-                    !string.Equals(jobIdInMessage, jobId.ToString(), StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
-                    eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
-                    decrypted.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
-                    decrypted.Contains("JobError", StringComparison.OrdinalIgnoreCase))
-                {
-                    summary.SawFinalEvent = true;
-                }
-
-                if (eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Some "JobFatalError" events are benign SPMI configuration notices that do not
-                    // actually abort file processing. Treat them as warnings so the job is not
-                    // incorrectly marked Failed.
-                    var isBenignFatal =
-                        message.Contains("source type is not specified", StringComparison.OrdinalIgnoreCase) ||
-                        message.Contains("SourceType", StringComparison.OrdinalIgnoreCase);
-
-                    if (isBenignFatal)
+                    var outerBody = msg.Body.ToString();
+                    string decrypted;
+                    try
                     {
-                        _logger.LogInformation("SPMI notice (non-fatal): [{Event}] {Message}", eventType, message);
+                        decrypted = DecryptQueueMessage(outerBody);
                     }
-                    else
+                    catch
                     {
-                        summary.SawFatalError = true;
-                        summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
+                        decrypted = outerBody;
                     }
-                }
+                    _logger.LogDebug("Queue report raw: {Message}", decrypted);
 
-                if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
-                    || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
-                    || eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Normalize message to reduce noisy call stacks that SPMI embeds
-                    var normalizedMessage = message;
-                    var callstackIndex = normalizedMessage.IndexOf("CallStack --", StringComparison.OrdinalIgnoreCase);
-                    if (callstackIndex > 0)
-                        normalizedMessage = normalizedMessage[..callstackIndex].TrimEnd();
+                    var json = Newtonsoft.Json.Linq.JObject.Parse(decrypted);
+                    var eventType = json["Event"]?.ToString() ?? "";
+                    var message = json["Message"]?.ToString()
+                               ?? json["ErrorMessage"]?.ToString() ?? "";
+                    var jobIdInMessage = json["JobId"]?.ToString();
 
-                    // Downgrade "already exists" to informational skip (do NOT treat as error)
-                    if (normalizedMessage.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrWhiteSpace(jobIdInMessage) &&
+                        !string.Equals(jobIdInMessage, jobId.ToString(), StringComparison.OrdinalIgnoreCase))
                     {
-                        summary.AlreadyExistsCount++;
-                        _logger.LogInformation("Skipped (exists): {Message}", normalizedMessage);
+                        await TryReleaseQueueMessageAsync(queueClient, msg).ConfigureAwait(false);
+                        continue;
                     }
-                    // Known benign SPMI warning during submit; treat as informational noise
-                    else if (normalizedMessage.Contains("The source type is not specified", StringComparison.OrdinalIgnoreCase))
-                    {
-                        _logger.LogInformation("SPMI notice: {Message}", normalizedMessage);
-                    }
-                    else
-                    {
-                        if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase))
-                            summary.OtherErrorCount++;
 
-                        summary.Errors.Add($"[{eventType}] {normalizedMessage}");
-                        var isWarning = eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase);
-                        if (isWarning)
-                            _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                    if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
+                        eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
+                        decrypted.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
+                        decrypted.Contains("JobError", StringComparison.OrdinalIgnoreCase))
+                    {
+                        summary.SawFinalEvent = true;
+                    }
+
+                    if (eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // SharePoint sometimes raises JobFatalError for destination conflicts (file/folder
+                        // already present). Treat those like Application 1 / DynamicETL-style re-runs: not a
+                        // hard failure — the pipeline continues and post-job metadata patch can still run.
+                        var isBenignFatal =
+                            message.Contains("source type is not specified", StringComparison.OrdinalIgnoreCase) ||
+                            message.Contains("SourceType", StringComparison.OrdinalIgnoreCase) ||
+                            IsBenignMigrationConflictMessage(message);
+
+                        if (isBenignFatal)
+                        {
+                            _logger.LogInformation("SPMI notice (non-fatal): [{Event}] {Message}", eventType, message);
+                        }
                         else
-                            _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                        {
+                            summary.SawFatalError = true;
+                            summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
+                        }
                     }
-                }
 
-                if (eventType.Contains("JobProgress", StringComparison.OrdinalIgnoreCase))
-                {
-                    summary.FilesCreated = Math.Max(summary.FilesCreated, ParseInt(json["FilesCreated"]?.ToString()));
-                    summary.TotalErrors = Math.Max(summary.TotalErrors, ParseInt(json["TotalErrors"]?.ToString()));
-                    var totalWarnings = ParseInt(json["TotalWarnings"]?.ToString());
-                    var objectsProcessed = ParseInt(json["ObjectsProcessed"]?.ToString());
-
-                    // Only log if progress changed or at least 30s passed since last progress log
-                    var nowUtc = DateTime.UtcNow;
-                    var changed = summary.FilesCreated != _lastQueueFilesCreated || summary.TotalErrors != _lastQueueErrors;
-                    var intervalElapsed = (nowUtc - _lastQueueProgressLogUtc) >= TimeSpan.FromSeconds(30);
-                    if (changed || intervalElapsed)
+                    if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase)
+                        || eventType.Contains("Fail", StringComparison.OrdinalIgnoreCase)
+                        || eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase))
                     {
-                        _lastQueueFilesCreated = summary.FilesCreated;
-                        _lastQueueErrors = summary.TotalErrors;
-                        _lastQueueProgressLogUtc = nowUtc;
-                        _logger.LogInformation(
-                            "Queue progress: created={FilesCreated}, objects={ObjectsProcessed}, errors={Errors}, warnings={Warnings}",
-                            summary.FilesCreated, objectsProcessed, summary.TotalErrors, totalWarnings);
-                    }
-                }
+                        var normalizedMessage = message;
+                        var callstackIndex = normalizedMessage.IndexOf("CallStack --", StringComparison.OrdinalIgnoreCase);
+                        if (callstackIndex > 0)
+                            normalizedMessage = normalizedMessage[..callstackIndex].TrimEnd();
 
-                if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))
-                {
-                    summary.FilesCreated = ParseInt(json["FilesCreated"]?.ToString());
-                    summary.TotalErrors = ParseInt(json["TotalErrors"]?.ToString());
+                        if (IsBenignMigrationConflictMessage(normalizedMessage))
+                        {
+                            summary.AlreadyExistsCount++;
+                            if (_settings.ReportExistingFilesAsOverwritten)
+                                _logger.LogInformation("Destination conflict treated as OK (overwrite/skip): {Message}", normalizedMessage);
+                            else
+                                _logger.LogInformation("Skipped (exists): {Message}", normalizedMessage);
+                        }
+                        else if (normalizedMessage.Contains("The source type is not specified", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _logger.LogInformation("SPMI notice: {Message}", normalizedMessage);
+                        }
+                        else
+                        {
+                            if (eventType.Contains("Error", StringComparison.OrdinalIgnoreCase))
+                                summary.OtherErrorCount++;
+
+                            summary.Errors.Add($"[{eventType}] {normalizedMessage}");
+                            var isWarning = eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase);
+                            if (isWarning)
+                                _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                            else
+                                _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                        }
+                    }
+
+                    if (eventType.Contains("JobProgress", StringComparison.OrdinalIgnoreCase))
+                    {
+                        summary.FilesCreated = Math.Max(summary.FilesCreated, ParseInt(json["FilesCreated"]?.ToString()));
+                        summary.TotalErrors = Math.Max(summary.TotalErrors, ParseInt(json["TotalErrors"]?.ToString()));
+                        var totalWarnings = ParseInt(json["TotalWarnings"]?.ToString());
+                        var objectsProcessed = ParseInt(json["ObjectsProcessed"]?.ToString());
+
+                        var nowUtc = DateTime.UtcNow;
+                        var changed = summary.FilesCreated != _lastQueueFilesCreated || summary.TotalErrors != _lastQueueErrors;
+                        var intervalElapsed = (nowUtc - _lastQueueProgressLogUtc) >= TimeSpan.FromSeconds(30);
+                        if (changed || intervalElapsed)
+                        {
+                            _lastQueueFilesCreated = summary.FilesCreated;
+                            _lastQueueErrors = summary.TotalErrors;
+                            _lastQueueProgressLogUtc = nowUtc;
+                            _logger.LogInformation(
+                                "Queue progress: created={FilesCreated}, objects={ObjectsProcessed}, errors={Errors}, warnings={Warnings}",
+                                summary.FilesCreated, objectsProcessed, summary.TotalErrors, totalWarnings);
+                        }
+                    }
+
+                    if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase))
+                    {
+                        summary.FilesCreated = ParseInt(json["FilesCreated"]?.ToString());
+                        summary.TotalErrors = ParseInt(json["TotalErrors"]?.ToString());
+                    }
+
+                    await TryDeleteQueueMessageAsync(queueClient, msg).ConfigureAwait(false);
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug("Could not parse queue message: {Error}", ex.Message);
+                catch (Exception ex)
+                {
+                    _logger.LogDebug("Could not parse queue message: {Error}", ex.Message);
+                    await TryReleaseQueueMessageAsync(queueClient, msg).ConfigureAwait(false);
+                }
             }
         }
 
@@ -681,14 +695,36 @@ public class SharePointMigrationService
             }
             else
             {
-                // Only real errors (not warnings or "already exists") affect final status.
-                // summary.Errors also contains warning-level entries; using OtherErrorCount
-                // avoids incorrectly classifying warning-only jobs as CompletedWithErrors.
                 summary.Status = summary.OtherErrorCount > 0 ? "CompletedWithErrors" : "Completed";
             }
         }
 
         return summary;
+    }
+
+    private static async Task TryDeleteQueueMessageAsync(QueueClient client, QueueMessage msg)
+    {
+        try
+        {
+            await client.DeleteMessageAsync(msg.MessageId, msg.PopReceipt).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Pop receipt may have expired.
+        }
+    }
+
+    private static async Task TryReleaseQueueMessageAsync(QueueClient client, QueueMessage msg)
+    {
+        try
+        {
+            await client.UpdateMessageAsync(msg.MessageId, msg.PopReceipt, visibilityTimeout: TimeSpan.Zero)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Pop receipt may have expired.
+        }
     }
 
     private sealed class QueueSummary
@@ -707,6 +743,26 @@ public class SharePointMigrationService
     private static int ParseInt(string? value)
     {
         return int.TryParse(value, out var parsed) ? parsed : 0;
+    }
+
+    /// <summary>
+    /// SPMI queue messages that indicate the destination already has the object — not a blocking error
+    /// for re-runs (client: same as tolerating overwrite / existing content).
+    /// </summary>
+    private static bool IsBenignMigrationConflictMessage(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("already exists", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("already been added", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("item already exists", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("folder already exists", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("file already exists", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("duplicate name", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("same name already exists", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("a file with the same name", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("name already exists", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsTransientRequestError(Exception ex)
@@ -806,8 +862,8 @@ public class SharePointMigrationService
                 new XAttribute("FileLocation", string.Empty),
                 new XAttribute("IncludeSecurity", "All"),
                 new XAttribute("IncludeVersions", "LastMajor"),
-                new XAttribute("ExportMethod", "ExportAll")
-                )));
+                new XAttribute("ExportMethod", "ExportAll"),
+                new XAttribute("SourceType", "None"))));
     }
 
     private string GenerateLookupListMap()
@@ -909,98 +965,6 @@ public class SharePointMigrationService
         }
 
         return XmlToString(new XDocument(new XDeclaration("1.0", "utf-8", null), root));
-    }
-
-    private Dictionary<string, IDictionary<string, string>> BuildFolderMetadataLookup(IEnumerable<FileRecord> records)
-    {
-        var folderMetadataByPath = new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var record in records)
-        {
-            if (record.FolderMetadata is not { Count: > 0 })
-                continue;
-
-            var recordPath = PathTransformService.SanitizeSharePointRelativePath(
-                record.MappedPath.Replace('\\', '/').Trim('/'));
-            if (string.IsNullOrWhiteSpace(recordPath))
-                continue;
-
-            var segments = recordPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            for (var i = 0; i < segments.Length - 1; i++)
-            {
-                var folderPath = string.Join("/", segments.Take(i + 1));
-                var relativeKey = NormalizeFolderMetadataRelativePath(folderPath, segments[0]);
-                if (string.IsNullOrWhiteSpace(relativeKey))
-                    continue;
-
-                if (!record.FolderMetadata.TryGetValue(relativeKey, out var metadata) || metadata.Count == 0)
-                    continue;
-
-                if (!folderMetadataByPath.TryGetValue(folderPath, out var merged))
-                {
-                    merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    folderMetadataByPath[folderPath] = merged;
-                }
-
-                foreach (var kvp in metadata)
-                {
-                    if (!string.IsNullOrWhiteSpace(kvp.Key))
-                        merged[kvp.Key] = kvp.Value ?? string.Empty;
-                }
-            }
-        }
-
-        return folderMetadataByPath;
-    }
-
-    private void AppendMetadataProperties(
-        XElement targetElement,
-        IDictionary<string, string> metadata,
-        XNamespace ns)
-    {
-        var properties = new XElement(ns + "Properties");
-        foreach (var kvp in metadata)
-        {
-            if (string.IsNullOrWhiteSpace(kvp.Key)) continue;
-            if (!_effectiveMetadataFieldMap.TryGetValue(kvp.Key, out var fieldInternalName) ||
-                string.IsNullOrWhiteSpace(fieldInternalName))
-            {
-                continue;
-            }
-
-            var value = kvp.Value ?? string.Empty;
-            // SPMI schema requires Value as an XML attribute — text content causes "Content mode is empty" error.
-            properties.Add(new XElement(ns + "Property",
-                new XAttribute("Name", fieldInternalName),
-                new XAttribute("Value", value)));
-        }
-
-        if (properties.HasElements)
-            targetElement.Add(properties);
-    }
-
-    private void AppendMetadataProperties(
-        XElement targetElement,
-        IDictionary<string, IDictionary<string, string>> folderMetadataByPath,
-        string folderPath,
-        XNamespace ns)
-    {
-        if (!folderMetadataByPath.TryGetValue(folderPath, out var metadata) || metadata.Count == 0)
-            return;
-
-        AppendMetadataProperties(targetElement, metadata, ns);
-    }
-
-    private static string NormalizeFolderMetadataRelativePath(string fullFolderPath, string libraryRootSegment)
-    {
-        var normalized = PathTransformService.SanitizeSharePointRelativePath(fullFolderPath.Replace('\\', '/').Trim('/'));
-        if (string.IsNullOrWhiteSpace(normalized))
-            return string.Empty;
-
-        var prefix = libraryRootSegment.Trim('/') + "/";
-        return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-            ? normalized[prefix.Length..]
-            : normalized;
     }
 
     private string GenerateRequirements()
@@ -1196,6 +1160,12 @@ public class SharePointMigrationService
 
                 if (!libraryCache.TryGetValue(metadataKey, out var internalName))
                 {
+                    if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await EnsureCaseMetadataTextFieldAsync(libraryTitle, displayName).ConfigureAwait(false);
+                    }
+
                     internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
                     libraryCache[metadataKey] = internalName;
                 }
@@ -1229,10 +1199,38 @@ public class SharePointMigrationService
             return _processFlags.GetSection("SHAREPOINT_CASEID_COLUMN_DISPLAY_NAME").Value;
         if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
             return _processFlags.GetSection("SHAREPOINT_CASETYPE_COLUMN_DISPLAY_NAME").Value;
-        if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
-            return _processFlags.GetSection("SHAREPOINT_DOCUMENTID_COLUMN_DISPLAY_NAME").Value ?? "Document ID";
 
         return null;
+    }
+
+    /// <summary>
+    /// Creates a single-line text column on the document library if it does not already exist
+    /// (phase 1: CaseId / CaseType). Does not throw; logs on failure.
+    /// </summary>
+    private async Task EnsureCaseMetadataTextFieldAsync(string libraryTitle, string displayName)
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+            return;
+
+        var existing = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(existing))
+            return;
+
+        try
+        {
+            var list = _web.Lists.GetByTitle(libraryTitle);
+            var escaped = SecurityElement.Escape(displayName) ?? displayName;
+            var schemaXml = "<Field Type='Text' DisplayName='" + escaped + "' />";
+            list.Fields.AddFieldAsXml(schemaXml, addToDefaultView: false, AddFieldOptions.DefaultValue);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            _logger.LogInformation("Created text column '{DisplayName}' on library '{Library}'.", displayName, libraryTitle);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not create text column '{DisplayName}' on library '{Library}'. Create the column manually or check permissions.",
+                displayName, libraryTitle);
+        }
     }
 
     private async Task<string?> ResolveFieldInternalNameAsync(string libraryTitle, string displayName)
@@ -1264,7 +1262,6 @@ public class SharePointMigrationService
     /// <summary>
     /// After SPMI jobs complete, patches CaseId and CaseType on SharePoint list items using
     /// batched CSOM (100 items per ExecuteQuery) instead of one-by-one Graph API calls.
-    /// DocumentId is intentionally excluded — deferred for a later phase.
     /// </summary>
     /// <param name="records">Records whose Metadata contains CaseId/CaseType values.</param>
     /// <param name="libraryTitle">SharePoint document library title (e.g. "2010").</param>

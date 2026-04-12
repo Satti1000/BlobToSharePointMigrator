@@ -1,4 +1,4 @@
-﻿namespace BlobToSharePointMigrator.Models;
+namespace BlobToSharePointMigrator.Models;
 
 // SharePoint Migration Job models
 public class MigrationJobInfo
