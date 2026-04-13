@@ -103,7 +103,8 @@ public class ReportService
         int filesPlannedToMigrate = 0,
         int estimatedCaseFolders = 0,
         int otherErrorConflicts = 0,
-        bool reportExistingFilesAsOverwritten = false)
+        bool reportExistingFilesAsOverwritten = false,
+        string? summaryYearLabel = null)
     {
         var success  = results.Count(r => r.Status == "Success");
         var partial  = results.Count(r => r.Status == "PartialSuccess");
@@ -114,6 +115,8 @@ public class ReportService
         var lines = new System.Text.StringBuilder();
         lines.AppendLine();
         lines.AppendLine("========== BlobToSharePointSync run summary ==========");
+        if (!string.IsNullOrWhiteSpace(summaryYearLabel))
+            lines.AppendLine($"  Year (YYYY scope):                   {summaryYearLabel}");
         if (blobsListed > 0)            lines.AppendLine($"  Blobs listed (container/prefix):     {blobsListed}");
         lines.AppendLine($"  Skipped (invalid/filtered):          {skipped.Count}");
         if (reportExistingFilesAsOverwritten && alreadyExistsConflicts > 0)
@@ -123,7 +126,8 @@ public class ReportService
         if (filesPlannedToMigrate > 0) lines.AppendLine($"  Files planned to migrate:            {filesPlannedToMigrate}");
         lines.AppendLine($"  Files uploaded successfully:         {success + partial}");
         lines.AppendLine($"  Failed uploads:                      {failed}");
-        if (estimatedCaseFolders > 0)  lines.AppendLine($"  Case-number folders patched:         {estimatedCaseFolders}");
+        if (estimatedCaseFolders > 0)
+            lines.AppendLine($"  Unique case folders in plan (YYYY/Case): {estimatedCaseFolders}");
         lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");
         lines.AppendLine("======================================================");
         lines.AppendLine($"  Report saved:      {_settings.ReportFile}");

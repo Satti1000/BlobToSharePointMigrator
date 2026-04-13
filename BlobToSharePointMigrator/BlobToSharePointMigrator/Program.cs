@@ -1,9 +1,11 @@
 using BlobToSharePointMigrator.Configuration;
+using BlobToSharePointMigrator.Models;
 using BlobToSharePointMigrator.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Serilog;
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
 Console.WriteLine();
@@ -97,6 +99,42 @@ static string StripLibraryPrefix(string mappedPath, string libraryPrefix)
     return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
         ? normalized[prefix.Length..]
         : normalized;
+}
+
+static string BuildSummaryYearLabel(MigrationSettings s, List<FileRecord> files)
+{
+    if (s.MigrationYear > 0)
+        return s.MigrationYear.ToString();
+    if (files.Count == 0)
+        return "—";
+    var years = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var r in files)
+    {
+        var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+        var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segs.Length > 0 && Regex.IsMatch(segs[0], "^\\d{4}$"))
+            years.Add(segs[0]);
+    }
+    if (years.Count == 0)
+        return "—";
+    var ordered = years.OrderBy(y => y).ToList();
+    if (ordered.Count == 1)
+        return ordered[0];
+    if (ordered.Count <= 5)
+        return string.Join(", ", ordered);
+    return string.Join(", ", ordered.Take(5)) + ", …";
+}
+
+static bool MigrationJobHasSaveConflictErrors(MigrationJobInfo info)
+{
+    foreach (var e in info.Errors)
+    {
+        if (e.Contains("Save Conflict", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (e.Contains("conflict with those made concurrently", StringComparison.OrdinalIgnoreCase))
+            return true;
+    }
+    return false;
 }
 
 try
@@ -197,7 +235,8 @@ try
     {
         logger.LogInformation("No files to migrate (all already migrated or filtered)");
         reportSvc.SaveDeltaTracking();
-        reportSvc.PrintSummary(new List<BlobToSharePointMigrator.Models.MigrationResult>(), skipped, 0, records.Count, toMigrate.Count, 0, 0, migrationSettings.ReportExistingFilesAsOverwritten);
+        reportSvc.PrintSummary(new List<MigrationResult>(), skipped, 0, records.Count, toMigrate.Count, 0, 0,
+            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate));
         Environment.Exit(0);
     }
 
@@ -257,9 +296,11 @@ try
     var aggregateOtherErrors = 0;
     var deltaLock = new object();
 
-    // Run with limited parallelism based on config
+    // Run with limited parallelism across batches; also serialize SPMI jobs that target the same
+    // document library (e.g. same YYYY) to reduce SharePoint Save Conflict (JobError) from concurrent imports.
     var parallelJobs = Math.Max(1, migrationSettings.MaxParallelJobs);
-    using (var gate = new System.Threading.SemaphoreSlim(parallelJobs))
+    var libraryJobSemaphores = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
+    using (var gate = new SemaphoreSlim(parallelJobs))
     {
         var tasks = new List<Task>();
         for (int i = 0; i < batchesToRun.Count; i++)
@@ -269,6 +310,13 @@ try
             await gate.WaitAsync();
             tasks.Add(Task.Run(async () =>
             {
+                string targetLibrary = migrationSettings.YearAsLibrary
+                    ? ((batch.Select(b => (b.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
+                        .FirstOrDefault())?.Trim() ?? string.Empty)
+                    : migrationSettings.SharePointDocumentLibrary ?? string.Empty;
+                var libraryLockKey = string.IsNullOrWhiteSpace(targetLibrary) ? "__defaultLibrary" : targetLibrary;
+                var libSem = libraryJobSemaphores.GetOrAdd(libraryLockKey, _ => new SemaphoreSlim(1, 1));
+                await libSem.WaitAsync();
                 try
                 {
                     // Try to extract a single case folder id (YYYY/CaseNumber) for nicer progress logs
@@ -286,12 +334,6 @@ try
                     var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
                     var caseIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseId", out var value) && !string.IsNullOrWhiteSpace(value));
                     var caseTypeAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseType", out var value) && !string.IsNullOrWhiteSpace(value));
-
-                    // Determine target library for this batch
-                    string targetLibrary = migrationSettings.YearAsLibrary
-                        ? ((batch.Select(b => (b.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
-                            .FirstOrDefault())?.Trim() ?? string.Empty)
-                        : migrationSettings.SharePointDocumentLibrary;
 
                     logger.LogInformation(
                         "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount} — sample file: {File} — library: {Library}",
@@ -313,7 +355,7 @@ try
                         var prefixToTrim = targetLibrary + "/";
                         batchForSubmit = batch.Select(r =>
                         {
-                            var cloned = new BlobToSharePointMigrator.Models.FileRecord
+                            var cloned = new FileRecord
                             {
                                 Name = r.Name,
                                 BlobPath = r.BlobPath,
@@ -332,17 +374,39 @@ try
                             return cloned;
                         }).ToList();
                     }
-                    var jobInfo = await batchSpService.SubmitMigrationJobAsync(batchForSubmit, blobService.DownloadBlobAsync, targetLibrary);
-                    logger.LogInformation("Migration job submitted: {JobId}", jobInfo.JobId);
 
                     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
                     var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
-                    var finalJobInfo = await batchSpService.PollMigrationJobAsync(
-                        jobInfo.JobId,
-                        TimeSpan.FromMinutes(timeoutMinutes),
-                        pollIntervalSeconds * 1000,
-                        batch.Count);
-                    await batchSpService.CleanupStagingContainersAsync();
+                    var maxSaveConflictRetries = Math.Max(0, migrationSettings.MigrationJobSaveConflictRetries);
+                    var retryDelaySec = Math.Max(5, migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
+
+                    MigrationJobInfo finalJobInfo = null!;
+                    for (var attempt = 0; ; attempt++)
+                    {
+                        var jobInfo = await batchSpService.SubmitMigrationJobAsync(batchForSubmit, blobService.DownloadBlobAsync, targetLibrary);
+                        logger.LogInformation("Migration job submitted: {JobId} (submit attempt {Attempt})", jobInfo.JobId, attempt + 1);
+
+                        finalJobInfo = await batchSpService.PollMigrationJobAsync(
+                            jobInfo.JobId,
+                            TimeSpan.FromMinutes(timeoutMinutes),
+                            pollIntervalSeconds * 1000,
+                            batch.Count);
+                        await batchSpService.CleanupStagingContainersAsync();
+
+                        var saveConflict = MigrationJobHasSaveConflictErrors(finalJobInfo);
+                        var underProcessed = finalJobInfo.ProcessedFileCount < batch.Count;
+                        var badStatus = finalJobInfo.Status == "CompletedWithErrors" || finalJobInfo.Status == "Failed";
+                        var canRetry = attempt < maxSaveConflictRetries && saveConflict && underProcessed && badStatus;
+
+                        if (!canRetry)
+                            break;
+
+                        logger.LogWarning(
+                            "SPMI Save Conflict (JobError); resubmitting after {Delay}s. Processed={Processed}/{Total}. Retries used: {Attempt}/{Max}. See: https://sharepoint.stackexchange.com/q/184207",
+                            retryDelaySec, finalJobInfo.ProcessedFileCount, batch.Count, attempt + 1, maxSaveConflictRetries);
+                        await Task.Delay(TimeSpan.FromSeconds(retryDelaySec));
+                    }
+
                     Interlocked.Add(ref aggregateAlreadyExists, finalJobInfo.AlreadyExistsCount);
                     Interlocked.Add(ref aggregateOtherErrors, finalJobInfo.OtherErrorCount);
 
@@ -413,7 +477,7 @@ try
                     {
                         var catchLibrary = migrationSettings.YearAsLibrary
                             ? (record.MappedPath.Replace('\\', '/').Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty)
-                            : migrationSettings.SharePointDocumentLibrary;
+                            : migrationSettings.SharePointDocumentLibrary ?? string.Empty;
                         var catchDestPath = StripLibraryPrefix(record.MappedPath, catchLibrary);
                         var failed = new BlobToSharePointMigrator.Models.MigrationResult
                         {
@@ -435,6 +499,7 @@ try
                 }
                 finally
                 {
+                    libSem.Release();
                     gate.Release();
                 }
             }));
@@ -509,7 +574,8 @@ try
         toMigrate.Count,
         estimatedCaseFolders,
         aggregateOtherErrors,
-        migrationSettings.ReportExistingFilesAsOverwritten);
+        migrationSettings.ReportExistingFilesAsOverwritten,
+        BuildSummaryYearLabel(migrationSettings, toMigrate));
 
     logger.LogInformation(string.Empty);
     logger.LogInformation("Migration complete! Submitted jobs: {Jobs}, Total files: {Total}", batchesToRun.Count, toMigrate.Count);

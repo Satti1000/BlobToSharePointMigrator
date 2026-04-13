@@ -15,6 +15,7 @@ using System.Net;
 using System.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
+using Newtonsoft.Json.Linq;
 
 namespace BlobToSharePointMigrator.Services;
 
@@ -571,9 +572,10 @@ public class SharePointMigrationService
                     {
                         decrypted = outerBody;
                     }
+                    // Full payload at Debug; JobError also gets structured + Information raw below.
                     _logger.LogDebug("Queue report raw: {Message}", decrypted);
 
-                    var json = Newtonsoft.Json.Linq.JObject.Parse(decrypted);
+                    var json = JObject.Parse(decrypted);
                     var eventType = json["Event"]?.ToString() ?? "";
                     var message = json["Message"]?.ToString()
                                ?? json["ErrorMessage"]?.ToString() ?? "";
@@ -646,7 +648,14 @@ public class SharePointMigrationService
                             if (isWarning)
                                 _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
                             else
-                                _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                            {
+                                var isJobLevelDiagnostic = eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase)
+                                    || eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase);
+                                if (isJobLevelDiagnostic)
+                                    LogSpmiJobQueueDiagnostics(jobId, eventType, json, normalizedMessage, decrypted);
+                                else
+                                    _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
+                            }
                         }
                     }
 
@@ -681,7 +690,7 @@ public class SharePointMigrationService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug("Could not parse queue message: {Error}", ex.Message);
+                    _logger.LogWarning(ex, "Could not parse or handle SPMI queue message for job {JobId}.", jobId);
                     await TryReleaseQueueMessageAsync(queueClient, msg).ConfigureAwait(false);
                 }
             }
@@ -700,6 +709,48 @@ public class SharePointMigrationService
         }
 
         return summary;
+    }
+
+    /// <summary>
+    /// Logs structured fields from SPMI queue JSON so JobError / JobFatalError can be diagnosed from logs
+    /// without guessing (Url, ErrorCode, ObjectType, etc.). Raw JSON is logged at Information (size-capped).
+    /// </summary>
+    private void LogSpmiJobQueueDiagnostics(Guid pipelineJobId, string eventType, JObject json, string messageSummary, string fullDecryptedPayload)
+    {
+        var queueJobId = json["JobId"]?.ToString() ?? string.Empty;
+        var objectType = json["ObjectType"]?.ToString() ?? string.Empty;
+        var url = json["Url"]?.ToString() ?? string.Empty;
+        var errorCode = json["ErrorCode"]?.ToString() ?? string.Empty;
+        var errorType = json["ErrorType"]?.ToString() ?? string.Empty;
+        var itemId = json["Id"]?.ToString() ?? string.Empty;
+        var direction = json["MigrationDirection"]?.ToString() ?? string.Empty;
+        var migrationType = json["MigrationType"]?.ToString() ?? string.Empty;
+        var time = json["Time"]?.ToString() ?? string.Empty;
+
+        var msg = string.IsNullOrWhiteSpace(messageSummary) ? "(no message body)" : messageSummary;
+
+        _logger.LogError(
+            "SPMI {Event}: PipelineJobId={PipelineJobId} QueueJobId={QueueJobId} Time={Time} ObjectType={ObjectType} Url={Url} ErrorCode={ErrorCode} ErrorType={ErrorType} ItemId={ItemId} MigrationDirection={Direction} MigrationType={MigrationType} Message={Message}",
+            eventType,
+            pipelineJobId,
+            queueJobId,
+            time,
+            objectType,
+            url,
+            errorCode,
+            errorType,
+            itemId,
+            direction,
+            migrationType,
+            msg);
+
+        const int maxRawChars = 16000;
+        if (string.IsNullOrEmpty(fullDecryptedPayload))
+            return;
+        var raw = fullDecryptedPayload.Length <= maxRawChars
+            ? fullDecryptedPayload
+            : fullDecryptedPayload[..maxRawChars] + " …(truncated)";
+        _logger.LogInformation("SPMI queue JSON (JobError diagnostic, PipelineJobId={PipelineJobId}): {RawJson}", pipelineJobId, raw);
     }
 
     private static async Task TryDeleteQueueMessageAsync(QueueClient client, QueueMessage msg)
