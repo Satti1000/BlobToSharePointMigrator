@@ -46,7 +46,7 @@ public class PathTransformService
                 _sharePointTargetFolder,
                 _useYyyyCaseNumberPath);
             var safeDyn = SanitizeSharePointRelativePath(candidate);
-            _logger.LogDebug("Mapped (DynamicETL fallback): {Source} -> {Destination}", blobPath, safeDyn);
+            _logger.LogDebug("Mapped (Data Migration): {Source} -> {Destination}", blobPath, safeDyn);
             return safeDyn;
         }
 
@@ -101,8 +101,12 @@ public class PathTransformService
             {
                 count++;
                 seen[mapped] = count;
+                var collisionPath = mapped;
                 mapped = AppendDuplicateSuffix(mapped, count);
-                _logger.LogWarning("Duplicate mapped path detected. Adjusted to: {MappedPath}", mapped);
+                _logger.LogWarning(
+                    "Duplicate mapped path: multiple source blobs resolved to the same target \"{CollisionPath}\"; renamed to \"{MappedPath}\" for this run (planning step only—not SharePoint reporting a missing file).",
+                    collisionPath,
+                    mapped);
             }
             else
             {

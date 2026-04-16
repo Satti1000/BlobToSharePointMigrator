@@ -64,6 +64,12 @@ var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
+// Client visibility: always emit BlobFolderPrefix at start of the log (empty = no prefix filter on inventory).
+var blobFolderPrefixLogValue = string.IsNullOrWhiteSpace(migrationSettings.BlobFolderPrefix)
+    ? "(empty — no BlobFolderPrefix filter; full container inventory per other settings)"
+    : migrationSettings.BlobFolderPrefix.Replace('\\', '/').TrimEnd('/');
+logger.LogInformation("Migration:BlobFolderPrefix = {BlobFolderPrefix}", blobFolderPrefixLogValue);
+
 static void ValidateStartupSettings(MigrationSettings migrationSettings)
 {
     var errors = new List<string>();

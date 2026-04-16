@@ -15,6 +15,8 @@ using System.Net;
 using System.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
+using System.Linq;
+using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 
 namespace BlobToSharePointMigrator.Services;
@@ -347,6 +349,18 @@ public class SharePointMigrationService
                 await using var stream = await blobDownloader(record.BlobPath);
                 await UploadEncryptedBlobAsync(dataContainer, targetPath, stream);
 
+                if (_settings.LogPerFileCaseProgress)
+                {
+                    record.Metadata.TryGetValue("CaseId", out var caseId);
+                    record.Metadata.TryGetValue("CaseType", out var caseType);
+                    _logger.LogInformation(
+                        "File packaged for SharePoint import: CaseId={CaseId} CaseType={CaseType} File={FileName} TargetPath={TargetPath} (encrypted staging complete; library write follows via migration job)",
+                        string.IsNullOrWhiteSpace(caseId) ? "—" : caseId,
+                        string.IsNullOrWhiteSpace(caseType) ? "—" : caseType,
+                        record.Name,
+                        targetPath);
+                }
+
                 var finished = Interlocked.Increment(ref uploadedCount);
                 if (finished % 250 == 0 || finished == validRecords.Count)
                 {
@@ -465,7 +479,9 @@ public class SharePointMigrationService
             {
                 // SharePoint sometimes returns None without a clear transition. We use the migration queue
                 // to determine whether we reached a final event (JobEnd/JobError).
-                _logger.LogInformation("Job {JobId} returned State=None. Reading queue report...", jobId);
+                _logger.LogInformation("Job {JobId} returned State=None.", jobId);
+                _logger.LogInformation("{QueueReportBanner}", new string('*', 85));
+                _logger.LogInformation("Job {JobId} — Reading queue report...", jobId);
                 var queueSummary = await ReadQueueReportAsync(jobId);
 
                 if (queueSummary.Status is "Completed" or "CompletedWithErrors" or "Failed")
@@ -481,10 +497,20 @@ public class SharePointMigrationService
                         if (queueSummary.Errors.Count > 0)
                         {
                             _logger.LogInformation("---- Job errors (non-existence) ----");
-                            foreach (var err in queueSummary.Errors)
+                            foreach (var g in queueSummary.Errors
+                                         .GroupBy(QueueErrorListGroupingKey, StringComparer.OrdinalIgnoreCase)
+                                         .OrderByDescending(g => g.Count()))
                             {
-                                _logger.LogError("{Error}", err);
+                                var representative = g.First();
+                                if (g.Count() == 1)
+                                    _logger.LogError("{Error}", representative);
+                                else
+                                    _logger.LogError(
+                                        "{Error} (repeated ×{RepeatCount} in job error list — same summary text; per-URL detail is in SPMI JobError lines above when logged)",
+                                        representative,
+                                        g.Count());
                             }
+
                             _logger.LogInformation("---- End errors ----");
                         }
                     return new MigrationJobInfo
@@ -541,6 +567,12 @@ public class SharePointMigrationService
         var receiveVisibility = TimeSpan.FromMinutes(5);
         const int maxRounds = 500;
 
+        _logger.LogInformation("{QueueBanner}", new string('=', 85));
+        _logger.LogInformation("SPMI migration queue — reading report messages for job {JobId}", jobId);
+
+        // Same SharePoint failure (e.g. Save Conflict) often repeats per file — log full JSON once per signature per read.
+        var jobDiagnosticDedup = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
         for (var round = 0; round < maxRounds && !summary.SawFinalEvent; round++)
         {
             Azure.Response<QueueMessage[]> response;
@@ -572,9 +604,6 @@ public class SharePointMigrationService
                     {
                         decrypted = outerBody;
                     }
-                    // Full payload at Debug; JobError also gets structured + Information raw below.
-                    _logger.LogDebug("Queue report raw: {Message}", decrypted);
-
                     var json = JObject.Parse(decrypted);
                     var eventType = json["Event"]?.ToString() ?? "";
                     var message = json["Message"]?.ToString()
@@ -587,6 +616,28 @@ public class SharePointMigrationService
                         await TryReleaseQueueMessageAsync(queueClient, msg).ConfigureAwait(false);
                         continue;
                     }
+
+                    if (eventType.Contains("JobWarning", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var preview = message;
+                        var stackIdx = preview.IndexOf("CallStack --", StringComparison.OrdinalIgnoreCase);
+                        if (stackIdx > 0)
+                            preview = preview[..stackIdx].TrimEnd();
+                        if (string.IsNullOrWhiteSpace(preview))
+                            preview = "(no message body)";
+                        const int maxPreviewChars = 450;
+                        if (preview.Length > maxPreviewChars)
+                            preview = preview[..maxPreviewChars] + " …";
+                        _logger.LogWarning("SPMI JobWarning (JobId={JobId}): {Preview}", jobId, preview);
+                    }
+
+                    // Full payload at Debug. Omit raw JSON for high-noise or fully-diagnosed-at-Error events.
+                    var omitQueueRawDebug =
+                        eventType.Contains("JobProgress", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(eventType, "JobError", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(eventType, "JobFatalError", StringComparison.OrdinalIgnoreCase);
+                    if (!omitQueueRawDebug)
+                        _logger.LogDebug("Queue report raw: {Message}", decrypted);
 
                     if (eventType.Contains("JobEnd", StringComparison.OrdinalIgnoreCase) ||
                         eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase) ||
@@ -645,14 +696,15 @@ public class SharePointMigrationService
 
                             summary.Errors.Add($"[{eventType}] {normalizedMessage}");
                             var isWarning = eventType.Contains("Warning", StringComparison.OrdinalIgnoreCase);
-                            if (isWarning)
+                            // JobWarning already logged above as WRN with a clear prefix; avoid duplicate lines.
+                            if (isWarning && !string.Equals(eventType, "JobWarning", StringComparison.OrdinalIgnoreCase))
                                 _logger.LogWarning("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
-                            else
+                            else if (!isWarning)
                             {
                                 var isJobLevelDiagnostic = eventType.Contains("JobError", StringComparison.OrdinalIgnoreCase)
                                     || eventType.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase);
                                 if (isJobLevelDiagnostic)
-                                    LogSpmiJobQueueDiagnostics(jobId, eventType, json, normalizedMessage, decrypted);
+                                    LogSpmiJobQueueDiagnostics(jobId, eventType, json, normalizedMessage, decrypted, jobDiagnosticDedup);
                                 else
                                     _logger.LogError("Migration issue: [{Event}] {Message}", eventType, normalizedMessage);
                             }
@@ -708,14 +760,68 @@ public class SharePointMigrationService
             }
         }
 
+        LogRepeatedSpmiQueueErrorSummary(jobId, summary.Errors);
         return summary;
+    }
+
+    /// <summary>Groups <c>[JobError] message…</c> lines that share the same first line of body text.</summary>
+    private static string QueueErrorListGroupingKey(string entry)
+    {
+        var t = (entry ?? string.Empty).Trim();
+        var bracket = t.IndexOf(']');
+        var body = bracket >= 0 && bracket + 1 < t.Length ? t[(bracket + 1)..].Trim() : t;
+        var firstNl = body.IndexOf('\n');
+        if (firstNl > 0)
+            body = body[..firstNl].Trim();
+        return string.IsNullOrEmpty(body) ? t : body;
+    }
+
+    /// <summary>
+    /// When many queue errors share the same opening line (e.g. every file hits the same Save Conflict),
+    /// emit one clear summary so logs are easier to interpret for large jobs (5k–10k files).
+    /// </summary>
+    private void LogRepeatedSpmiQueueErrorSummary(Guid jobId, IReadOnlyList<string> errors)
+    {
+        if (errors.Count < 2)
+            return;
+
+        var groups = errors
+            .GroupBy(QueueErrorListGroupingKey, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ToList();
+        var dominant = groups[0];
+        if (dominant.Count() < 2)
+            return;
+
+        var ratio = (double)dominant.Count() / errors.Count;
+        if (dominant.Count() < 3 && ratio < 0.75)
+            return;
+
+        var snippet = dominant.Key.Length > 200 ? dominant.Key[..200] + "…" : dominant.Key;
+        _logger.LogWarning(
+            "SPMI job {JobId}: {Total} queue error line(s); {RepeatCount} share the same first-line text ({Ratio:P0} of lines): \"{Snippet}\". " +
+            "Repeated identical wording across many files usually means one systemic SharePoint import condition (not a separate bug per file).",
+            jobId,
+            errors.Count,
+            dominant.Count(),
+            ratio,
+            snippet);
     }
 
     /// <summary>
     /// Logs structured fields from SPMI queue JSON so JobError / JobFatalError can be diagnosed from logs
-    /// without guessing (Url, ErrorCode, ObjectType, etc.). Raw JSON is logged at Information (size-capped).
+    /// without guessing (Url, ErrorCode, ObjectType, etc.). Raw JSON is logged at Error (size-capped) so
+    /// log filters show the full diagnostic under [ERR] with the structured line above.
+    /// When <paramref name="jobDiagnosticDedup"/> is provided, repeated identical ErrorCode + first message line
+    /// in the same queue read emit a compact [ERR] only (avoids hundreds of duplicate multi-KB JSON blocks).
     /// </summary>
-    private void LogSpmiJobQueueDiagnostics(Guid pipelineJobId, string eventType, JObject json, string messageSummary, string fullDecryptedPayload)
+    private void LogSpmiJobQueueDiagnostics(
+        Guid pipelineJobId,
+        string eventType,
+        JObject json,
+        string messageSummary,
+        string fullDecryptedPayload,
+        Dictionary<string, int>? jobDiagnosticDedup = null)
     {
         var queueJobId = json["JobId"]?.ToString() ?? string.Empty;
         var objectType = json["ObjectType"]?.ToString() ?? string.Empty;
@@ -728,6 +834,36 @@ public class SharePointMigrationService
         var time = json["Time"]?.ToString() ?? string.Empty;
 
         var msg = string.IsNullOrWhiteSpace(messageSummary) ? "(no message body)" : messageSummary;
+
+        if (jobDiagnosticDedup != null &&
+            (string.Equals(eventType, "JobError", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(eventType, "JobFatalError", StringComparison.OrdinalIgnoreCase)))
+        {
+            var firstLine = msg;
+            var nl = firstLine.IndexOf('\n');
+            if (nl > 0)
+                firstLine = firstLine[..nl].Trim();
+            if (firstLine.Length > 400)
+                firstLine = firstLine[..400] + "…";
+            var signature = $"{eventType}|{errorCode}|{firstLine}";
+            if (jobDiagnosticDedup.TryGetValue(signature, out var prior))
+            {
+                var occurrence = prior + 1;
+                jobDiagnosticDedup[signature] = occurrence;
+                _logger.LogError(
+                    "SPMI {Event} (repeated pattern #{Occurrence} in this queue read; full structured + JSON omitted — same ErrorCode and first line as earlier): PipelineJobId={PipelineJobId} Url={Url} ItemId={ItemId} ErrorCode={ErrorCode} MessageFirstLine={FirstLine}",
+                    eventType,
+                    occurrence,
+                    pipelineJobId,
+                    url,
+                    itemId,
+                    errorCode,
+                    firstLine);
+                return;
+            }
+
+            jobDiagnosticDedup[signature] = 1;
+        }
 
         _logger.LogError(
             "SPMI {Event}: PipelineJobId={PipelineJobId} QueueJobId={QueueJobId} Time={Time} ObjectType={ObjectType} Url={Url} ErrorCode={ErrorCode} ErrorType={ErrorType} ItemId={ItemId} MigrationDirection={Direction} MigrationType={MigrationType} Message={Message}",
@@ -750,7 +886,7 @@ public class SharePointMigrationService
         var raw = fullDecryptedPayload.Length <= maxRawChars
             ? fullDecryptedPayload
             : fullDecryptedPayload[..maxRawChars] + " …(truncated)";
-        _logger.LogInformation("SPMI queue JSON (JobError diagnostic, PipelineJobId={PipelineJobId}): {RawJson}", pipelineJobId, raw);
+        _logger.LogError("SPMI queue JSON (JobError diagnostic, PipelineJobId={PipelineJobId}): {RawJson}", pipelineJobId, raw);
     }
 
     private static async Task TryDeleteQueueMessageAsync(QueueClient client, QueueMessage msg)

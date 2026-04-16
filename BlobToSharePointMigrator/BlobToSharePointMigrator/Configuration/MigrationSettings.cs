@@ -49,4 +49,11 @@ public class MigrationSettings
     /// overwrite/replace intent (client wording: "already exists and overwritten").
     /// </summary>
     public bool ReportExistingFilesAsOverwritten { get; set; } = true;
+
+    /// <summary>
+    /// When true, logs one Information line per file immediately after it is uploaded into the
+    /// encrypted migration package (staging). SharePoint still applies the package asynchronously
+    /// via the migration job; set false for very large jobs to reduce log volume.
+    /// </summary>
+    public bool LogPerFileCaseProgress { get; set; } = true;
 }
