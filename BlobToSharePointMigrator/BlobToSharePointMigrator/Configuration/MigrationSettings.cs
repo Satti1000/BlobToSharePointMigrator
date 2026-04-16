@@ -51,6 +51,13 @@ public class MigrationSettings
     public bool ReportExistingFilesAsOverwritten { get; set; } = true;
 
     /// <summary>
+    /// When true, loads <c>case_{caseNumber}_documents.xml</c> under each <c>*_Documents</c> case folder,
+    /// matches each file to manifest <c>Document</c> entries (exact / normalized / MIME-typed / extensionless stem),
+    /// and sets record <c>Metadata["DocumentId"]</c> (plus folder-level entries for email-style folder documents).
+    /// </summary>
+    public bool AssignDocumentIdFromCaseXml { get; set; } = true;
+
+    /// <summary>
     /// When true, logs one Information line per file immediately after it is uploaded into the
     /// encrypted migration package (staging). SharePoint still applies the package asynchronously
     /// via the migration job; set false for very large jobs to reduce log volume.

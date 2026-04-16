@@ -60,7 +60,7 @@ var transformSvc = new PathTransformService(
     migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
-var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
+var caseMetadataSvc = new CaseDocumentMetadataService(migrationSettings, loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
 
@@ -214,7 +214,7 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    logger.LogInformation("STEP 2.5/5 - Enriching CaseId and CaseType from blob paths...");
+    logger.LogInformation("STEP 2.5/5 - Enriching CaseId, CaseType, and DocumentId (paths; DocumentId from case_NNN_documents.xml when AssignDocumentIdFromCaseXml is true)...");
     await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
@@ -340,15 +340,17 @@ try
                     var sampleFile = batch.FirstOrDefault()?.BlobPath ?? string.Empty;
                     var caseIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseId", out var value) && !string.IsNullOrWhiteSpace(value));
                     var caseTypeAssignedCount = batch.Count(r => r.Metadata.TryGetValue("CaseType", out var value) && !string.IsNullOrWhiteSpace(value));
+                    var documentIdAssignedCount = batch.Count(r => r.Metadata.TryGetValue("DocumentId", out var value) && !string.IsNullOrWhiteSpace(value));
 
                     logger.LogInformation(
-                        "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount} — sample file: {File} — library: {Library}",
+                        "Submitting job {Index}/{TotalJobs} for {Count} files — state: processing {Case} — metadata: CaseId={CaseIdCount}, CaseType={CaseTypeCount}, DocumentId={DocumentIdCount} — sample file: {File} — library: {Library}",
                         index + 1,
                         batchesToRun.Count,
                         batch.Count,
                         caseLabel,
                         caseIdAssignedCount,
                         caseTypeAssignedCount,
+                        documentIdAssignedCount,
                         sampleFile,
                         targetLibrary);
                     // Use isolated service/context per concurrent batch to avoid shared-state contention.
@@ -514,8 +516,8 @@ try
         await Task.WhenAll(tasks);
     }
 
-    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType) ───────────────────────────────────
-    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType)...");
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId) ───────────────────────
+    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId)...");
     {
         var successBlobPaths = new HashSet<string>(allResults
             .Where(r => r.Status is "Success" or "PartialSuccess")

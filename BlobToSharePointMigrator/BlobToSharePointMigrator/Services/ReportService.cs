@@ -135,8 +135,7 @@ public class ReportService
         lines.Append    ("======================================================");
 
         var summary = lines.ToString();
-        // Write to both console (visible in terminal) and logger (visible in log files/sinks).
-        Console.WriteLine(summary);
+        // Single logger emission avoids duplicate blocks when console + file sinks both capture output.
         _logger.LogInformation("{Summary}", summary);
         // Per-file detail is already captured in the CSV report files; omit it here to keep
         // console output clean and prevent 10k+ lines from burying the summary.

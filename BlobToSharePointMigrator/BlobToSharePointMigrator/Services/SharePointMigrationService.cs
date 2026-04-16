@@ -1348,7 +1348,8 @@ public class SharePointMigrationService
                 if (!libraryCache.TryGetValue(metadataKey, out var internalName))
                 {
                     if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
+                        string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
                     {
                         await EnsureCaseMetadataTextFieldAsync(libraryTitle, displayName).ConfigureAwait(false);
                     }
@@ -1369,6 +1370,13 @@ public class SharePointMigrationService
                         metadataKey, displayName, libraryTitle);
                 }
             }
+
+            if (requiredKeys.Count > 0)
+            {
+                var mapped = string.Join(", ", _effectiveMetadataFieldMap.Select(kvp => $"{kvp.Key}→{kvp.Value}"));
+                _logger.LogInformation("Metadata field resolution for library '{Library}': {MappedCount} mapped keys [{Mapped}]",
+                    libraryTitle, _effectiveMetadataFieldMap.Count, mapped);
+            }
         }
         catch (Exception ex)
         {
@@ -1386,13 +1394,15 @@ public class SharePointMigrationService
             return _processFlags.GetSection("SHAREPOINT_CASEID_COLUMN_DISPLAY_NAME").Value;
         if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
             return _processFlags.GetSection("SHAREPOINT_CASETYPE_COLUMN_DISPLAY_NAME").Value;
+        if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
+            return _processFlags.GetSection("SHAREPOINT_DOCUMENTID_COLUMN_DISPLAY_NAME").Value;
 
         return null;
     }
 
     /// <summary>
     /// Creates a single-line text column on the document library if it does not already exist
-    /// (phase 1: CaseId / CaseType). Does not throw; logs on failure.
+    /// (CaseId / CaseType / DocumentId). Does not throw; logs on failure.
     /// </summary>
     private async Task EnsureCaseMetadataTextFieldAsync(string libraryTitle, string displayName)
     {
@@ -1447,10 +1457,10 @@ public class SharePointMigrationService
     // ── Bulk CSOM metadata patch ──────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// After SPMI jobs complete, patches CaseId and CaseType on SharePoint list items using
-    /// batched CSOM (100 items per ExecuteQuery) instead of one-by-one Graph API calls.
+    /// After SPMI jobs complete, patches CaseId, CaseType, and DocumentId (when present on records)
+    /// on SharePoint list items using batched CSOM (100 items per ExecuteQuery).
     /// </summary>
-    /// <param name="records">Records whose Metadata contains CaseId/CaseType values.</param>
+    /// <param name="records">Records whose Metadata contains CaseId/CaseType/DocumentId values.</param>
     /// <param name="libraryTitle">SharePoint document library title (e.g. "2010").</param>
     /// <param name="yearPrefixToStrip">
     /// When YearAsLibrary is true, pass the year string (e.g. "2010") so it is stripped from
@@ -1463,14 +1473,16 @@ public class SharePointMigrationService
     {
         if (records.Count == 0) return 0;
 
-        // Resolve CaseId / CaseType internal field names (best-effort; skip if unavailable).
+        // Resolve CaseId / CaseType / DocumentId internal field names (best-effort; skip if unavailable).
         string? caseIdField = null;
         string? caseTypeField = null;
+        string? documentIdField = null;
         try
         {
             await EnsureMetadataFieldMappingsAsync(records, libraryTitle).ConfigureAwait(false);
             _effectiveMetadataFieldMap.TryGetValue("CaseId", out caseIdField);
             _effectiveMetadataFieldMap.TryGetValue("CaseType", out caseTypeField);
+            _effectiveMetadataFieldMap.TryGetValue("DocumentId", out documentIdField);
         }
         catch (Exception ex)
         {
@@ -1478,11 +1490,19 @@ public class SharePointMigrationService
             return 0;
         }
 
-        if (string.IsNullOrWhiteSpace(caseIdField) && string.IsNullOrWhiteSpace(caseTypeField))
+        if (string.IsNullOrWhiteSpace(caseIdField) && string.IsNullOrWhiteSpace(caseTypeField) &&
+            string.IsNullOrWhiteSpace(documentIdField))
         {
-            _logger.LogInformation("No CaseId/CaseType fields configured for library '{Library}'; skipping bulk metadata patch.", libraryTitle);
+            _logger.LogInformation("No CaseId/CaseType/DocumentId fields configured for library '{Library}'; skipping bulk metadata patch.", libraryTitle);
             return 0;
         }
+
+        _logger.LogInformation(
+            "Bulk metadata field mapping for '{Library}': CaseIdField={CaseIdField}, CaseTypeField={CaseTypeField}, DocumentIdField={DocumentIdField}",
+            libraryTitle,
+            caseIdField ?? "(none)",
+            caseTypeField ?? "(none)",
+            documentIdField ?? "(none)");
 
         // Load the library root folder URL for building FolderServerRelativeUrl in CAML queries.
         var list = _web.Lists.GetByTitle(libraryTitle);
@@ -1494,7 +1514,8 @@ public class SharePointMigrationService
         // MappedPath example (YearAsLibrary): "2010/530341/filename.docx"
         // After stripping yearPrefix: "530341/filename.docx" → folder = "530341"
         var caseGroups = records
-            .Where(r => r.Metadata.ContainsKey("CaseId") || r.Metadata.ContainsKey("CaseType"))
+            .Where(r => r.Metadata.ContainsKey("CaseId") || r.Metadata.ContainsKey("CaseType") ||
+                        r.Metadata.ContainsKey("DocumentId"))
             .GroupBy(r =>
             {
                 var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').TrimStart('/');
@@ -1521,8 +1542,10 @@ public class SharePointMigrationService
             var rep = caseGroup.First();
             rep.Metadata.TryGetValue("CaseId", out var caseId);
             rep.Metadata.TryGetValue("CaseType", out var caseType);
+            rep.Metadata.TryGetValue("DocumentId", out var documentId);
 
-            if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType))
+            if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType) &&
+                string.IsNullOrWhiteSpace(documentId))
                 continue;
 
             var folderServerRelUrl = $"{rootFolderUrl}/{caseFolderRelPath}";
@@ -1550,7 +1573,7 @@ public class SharePointMigrationService
                     // Flush every 100 items to keep each ExecuteQuery batch small.
                     while (pending.Count >= 100)
                     {
-                        await FlushItemBatchAsync(pending.Take(100).ToList(), caseIdField, caseId, caseTypeField, caseType).ConfigureAwait(false);
+                        await FlushItemBatchAsync(pending.Take(100).ToList(), caseIdField, caseId, caseTypeField, caseType, documentIdField, documentId).ConfigureAwait(false);
                         totalPatched += 100;
                         pending.RemoveRange(0, 100);
                     }
@@ -1560,7 +1583,7 @@ public class SharePointMigrationService
                 // Flush any remainder.
                 if (pending.Count > 0)
                 {
-                    await FlushItemBatchAsync(pending, caseIdField, caseId, caseTypeField, caseType).ConfigureAwait(false);
+                    await FlushItemBatchAsync(pending, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentId).ConfigureAwait(false);
                     totalPatched += pending.Count;
                 }
             }
@@ -1580,7 +1603,8 @@ public class SharePointMigrationService
     private async Task FlushItemBatchAsync(
         List<ListItem> items,
         string? caseIdField, string? caseId,
-        string? caseTypeField, string? caseType)
+        string? caseTypeField, string? caseType,
+        string? documentIdField, string? documentId)
     {
         foreach (var item in items)
         {
@@ -1588,6 +1612,8 @@ public class SharePointMigrationService
                 item[caseIdField] = caseId;
             if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
                 item[caseTypeField] = caseType;
+            if (!string.IsNullOrWhiteSpace(documentIdField) && !string.IsNullOrWhiteSpace(documentId))
+                item[documentIdField] = documentId;
             item.SystemUpdate();
         }
         await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
