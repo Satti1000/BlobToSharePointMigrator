@@ -27,14 +27,8 @@ public class MigrationSettings
     public bool UseYyyyCaseNumberPath       { get; set; } = true;
     public bool YearAsLibrary               { get; set; } = true; // when true, target library title is the year (YYYY)
     public int MaxParallelJobs              { get; set; } = 3;
-
-    /// <summary>
-    /// When SPMI queue reports Save Conflict (concurrent update during import), resubmit the same
-    /// package up to this many extra times after a delay. Does not change metadata column logic.
-    /// </summary>
+    public bool EnableMigrationJobSaveConflictRetry { get; set; } = false;
     public int MigrationJobSaveConflictRetries { get; set; } = 1;
-
-    /// <summary>Seconds to wait before resubmitting after Save Conflict.</summary>
     public int MigrationJobSaveConflictRetryDelaySeconds { get; set; } = 45;
 
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName

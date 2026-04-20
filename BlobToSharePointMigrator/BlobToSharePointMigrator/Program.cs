@@ -296,6 +296,11 @@ try
 
     var batchesToRun = BuildBatches(toMigrate);
     logger.LogInformation("Submitting {BatchCount} migration job(s) ({Total} files total)...", batchesToRun.Count, toMigrate.Count);
+    logger.LogInformation(
+        "Migration:EnableMigrationJobSaveConflictRetry = {Enabled}. When true, Save Conflict resubmit uses MigrationJobSaveConflictRetries={Retries}, delay {Delay}s.",
+        migrationSettings.EnableMigrationJobSaveConflictRetry,
+        migrationSettings.MigrationJobSaveConflictRetries,
+        migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
 
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var aggregateAlreadyExists = 0;
@@ -385,7 +390,9 @@ try
 
                     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
                     var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
-                    var maxSaveConflictRetries = Math.Max(0, migrationSettings.MigrationJobSaveConflictRetries);
+                    var maxSaveConflictRetries = migrationSettings.EnableMigrationJobSaveConflictRetry
+                        ? Math.Max(0, migrationSettings.MigrationJobSaveConflictRetries)
+                        : 0;
                     var retryDelaySec = Math.Max(5, migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
 
                     MigrationJobInfo finalJobInfo = null!;
