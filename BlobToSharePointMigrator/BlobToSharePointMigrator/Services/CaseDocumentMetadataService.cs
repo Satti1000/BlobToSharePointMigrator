@@ -14,7 +14,6 @@ namespace BlobToSharePointMigrator.Services;
 /// </summary>
 public class CaseDocumentMetadataService
 {
-    private static readonly Regex CaseDocumentsFolderRegex = new(@"^(\d+)_Documents$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CaseManifestRegex = new(@"^case_(\d+)_documents\.xml$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CollapseWhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
     private const int UnmatchedSampleLimit = 5;
@@ -178,18 +177,8 @@ public class CaseDocumentMetadataService
         }
     }
 
-    internal static string? TryExtractCaseNumber(string blobPath)
-    {
-        var segments = blobPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        foreach (var segment in segments)
-        {
-            var match = CaseDocumentsFolderRegex.Match(segment);
-            if (match.Success)
-                return match.Groups[1].Value;
-        }
-
-        return null;
-    }
+    internal static string? TryExtractCaseNumber(string blobPath) =>
+        CaseDocumentsPathRules.TryGetAlignedCaseNumber(blobPath);
 
     internal static string? TryExtractCaseType(string blobPath)
     {
@@ -275,18 +264,12 @@ public class CaseDocumentMetadataService
 
     private static string? TryGetCaseDocumentsFolderKey(string blobPath)
     {
-        var normalized = (blobPath ?? string.Empty).Replace('\\', '/').Trim('/');
-        if (string.IsNullOrWhiteSpace(normalized))
+        var segments = CaseDocumentsPathRules.SplitPathSegments(blobPath);
+        var i = CaseDocumentsPathRules.FindAlignedDocumentsSegmentIndex(segments);
+        if (i < 0)
             return null;
 
-        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        for (var i = 0; i < segments.Length; i++)
-        {
-            if (CaseDocumentsFolderRegex.IsMatch(segments[i]))
-                return string.Join("/", segments.Take(i + 1));
-        }
-
-        return null;
+        return string.Join("/", segments.Take(i + 1));
     }
 
     private static bool IsCaseManifestFile(string fileName) => CaseManifestRegex.IsMatch(fileName ?? string.Empty);

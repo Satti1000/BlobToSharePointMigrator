@@ -158,23 +158,17 @@ public class PathTransformService
 
     private static string? TransformToYyyyCaseNumberPath(string blobPath)
     {
-        var segments = blobPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var segments = CaseDocumentsPathRules.SplitPathSegments(blobPath);
         if (segments.Length < 3) return null;
 
         string? year = segments[2];
+        var documentsIndex = CaseDocumentsPathRules.FindAlignedDocumentsSegmentIndex(segments);
         string? caseNumber = null;
-        var documentsIndex = -1;
-
-        for (int i = 0; i < segments.Length; i++)
+        if (documentsIndex >= 0)
         {
-            if (Regex.IsMatch(segments[i], @"^\d+_Documents$", RegexOptions.IgnoreCase))
-            {
-                var match = Regex.Match(segments[i], @"^(\d+)_Documents$", RegexOptions.IgnoreCase);
-                if (match.Success)
-                    caseNumber = match.Groups[1].Value;
-                documentsIndex = i;
-                break;
-            }
+            var docsMatch = Regex.Match(segments[documentsIndex], @"^(\d+)_Documents$", RegexOptions.IgnoreCase);
+            if (docsMatch.Success)
+                caseNumber = docsMatch.Groups[1].Value;
         }
 
         if (year == null || caseNumber == null || documentsIndex < 0 || documentsIndex >= segments.Length - 1)

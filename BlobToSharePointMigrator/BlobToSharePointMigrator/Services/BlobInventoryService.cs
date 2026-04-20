@@ -50,7 +50,7 @@ public class BlobInventoryService
         {
             await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: candidatePrefix))
             {
-                if (!IsUnderCaseNumberDocuments(blob.Name))
+                if (!CaseDocumentsPathRules.IsUnderAlignedCaseNumberDocuments(blob.Name))
                     continue;
 
                 var ext = Path.GetExtension(blob.Name).ToLowerInvariant();
@@ -121,11 +121,6 @@ public class BlobInventoryService
             return null;
 
         return $"{yearMatch.Groups[1].Value}/{caseTypeMatch.Groups[1].Value}";
-    }
-
-    private static bool IsUnderCaseNumberDocuments(string blobPath)
-    {
-        return Regex.IsMatch(blobPath, @"\b\d+_Documents\/", RegexOptions.IgnoreCase);
     }
 
     private static async Task<List<string>> BuildTargetPrefixesAsync(BlobContainerClient containerClient, string basePrefix)
