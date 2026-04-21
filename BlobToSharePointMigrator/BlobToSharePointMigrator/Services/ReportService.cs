@@ -124,8 +124,10 @@ public class ReportService
         else
             lines.AppendLine($"  Skipped (already exists in target):       {alreadyExistsConflicts}");
         if (filesPlannedToMigrate > 0) lines.AppendLine($"  Files planned to migrate:            {filesPlannedToMigrate}");
-        lines.AppendLine($"  Files uploaded successfully:         {success + partial}");
+        lines.AppendLine($"  Files uploaded successfully:         {success + partial}  (this run only — per-blob row status)");
         lines.AppendLine($"  Failed uploads:                      {failed}");
+        lines.AppendLine("  Note: SharePoint library item counts can exceed the rows above (previous migrations,");
+        lines.AppendLine("         folders, or how the library UI counts items). SPMI queue \"FilesCreated\" is not a library census.");
         if (estimatedCaseFolders > 0)
             lines.AppendLine($"  Unique case folders in plan (YYYY/Case): {estimatedCaseFolders}");
         lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");

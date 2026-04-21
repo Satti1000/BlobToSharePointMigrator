@@ -1343,8 +1343,28 @@ public class SharePointMigrationService
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            if (requiredKeys.Count == 0)
+            // Create/resolve columns for configured SimpleETL display names even when no file had that
+            // metadata key this run (e.g. DocumentId not in XML — otherwise "Document ID" column was never ensured).
+            var keysToResolve = new HashSet<string>(requiredKeys, StringComparer.OrdinalIgnoreCase);
+            foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId" })
+            {
+                if (!string.IsNullOrWhiteSpace(GetMetadataDisplayName(candidate)))
+                    keysToResolve.Add(candidate);
+            }
+
+            if (keysToResolve.Count == 0)
                 return;
+
+            var extrasConfigured = keysToResolve
+                .Where(k => !requiredKeys.Any(r => string.Equals(r, k, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            if (extrasConfigured.Count > 0)
+            {
+                _logger.LogInformation(
+                    "Ensuring SharePoint list columns for metadata keys configured in SimpleETL but absent on all records this run: {Keys} (library '{Library}').",
+                    string.Join(", ", extrasConfigured),
+                    libraryTitle);
+            }
 
             if (!_resolvedMetadataFieldMapByLibrary.TryGetValue(libraryTitle, out var libraryCache))
             {
@@ -1352,7 +1372,7 @@ public class SharePointMigrationService
                 _resolvedMetadataFieldMapByLibrary[libraryTitle] = libraryCache;
             }
 
-            foreach (var metadataKey in requiredKeys)
+            foreach (var metadataKey in keysToResolve)
             {
                 if (_effectiveMetadataFieldMap.ContainsKey(metadataKey))
                     continue;
@@ -1387,7 +1407,7 @@ public class SharePointMigrationService
                 }
             }
 
-            if (requiredKeys.Count > 0)
+            if (keysToResolve.Count > 0)
             {
                 var mapped = string.Join(", ", _effectiveMetadataFieldMap.Select(kvp => $"{kvp.Key}→{kvp.Value}"));
                 _logger.LogInformation("Metadata field resolution for library '{Library}': {MappedCount} mapped keys [{Mapped}]",
