@@ -680,10 +680,26 @@ public class SharePointMigrationService
                         if (IsBenignMigrationConflictMessage(normalizedMessage))
                         {
                             summary.AlreadyExistsCount++;
-                            if (_settings.ReportExistingFilesAsOverwritten)
-                                _logger.LogInformation("Destination conflict treated as OK (overwrite/skip): {Message}", normalizedMessage);
-                            else
-                                _logger.LogInformation("Skipped (exists): {Message}", normalizedMessage);
+                            // Benign JobFatalError: count only — already logged in the JobFatalError block above.
+                            if (!string.Equals(eventType, "JobFatalError", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (string.Equals(eventType, "JobError", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    // Client: "already exists" on re-runs — WRN, not ERR; not an app-thrown exception.
+                                    if (_settings.ReportExistingFilesAsOverwritten)
+                                        _logger.LogWarning(
+                                            "SPMI JobError: destination already exists (overwrite intent). Queue text may mention COM; application does not throw: {Message}",
+                                            normalizedMessage);
+                                    else
+                                        _logger.LogWarning(
+                                            "SPMI JobError: destination already exists (skipped). Queue text may mention COM; application does not throw: {Message}",
+                                            normalizedMessage);
+                                }
+                                else if (_settings.ReportExistingFilesAsOverwritten)
+                                    _logger.LogInformation("Destination conflict treated as OK (overwrite/skip): {Message}", normalizedMessage);
+                                else
+                                    _logger.LogInformation("Skipped (exists): {Message}", normalizedMessage);
+                            }
                         }
                         else if (normalizedMessage.Contains("The source type is not specified", StringComparison.OrdinalIgnoreCase))
                         {
