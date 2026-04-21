@@ -93,36 +93,28 @@ public class PathTransformService
 
     public List<FileRecord> TransformAll(List<FileRecord> records)
     {
-        var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var record in records.Where(r => r.IsAllowed))
+        // First blob to claim a destination wins (by sorted blob path for stable runs); later collisions are skipped
+        // — no __dup* renames in SharePoint.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in records.Where(r => r.IsAllowed).OrderBy(r => r.BlobPath, StringComparer.OrdinalIgnoreCase))
         {
             var mapped = Transform(record.BlobPath);
-            if (seen.TryGetValue(mapped, out var count))
+            if (seen.Contains(mapped))
             {
-                count++;
-                seen[mapped] = count;
-                var collisionPath = mapped;
-                mapped = AppendDuplicateSuffix(mapped, count);
+                record.IsAllowed = false;
+                record.SkipReason =
+                    $"Duplicate mapped path: same destination as another file ({mapped}). Skipped so only one file uses that name in SharePoint.";
                 _logger.LogWarning(
-                    "Duplicate mapped path: multiple source blobs resolved to the same target \"{CollisionPath}\"; renamed to \"{MappedPath}\" for this run (planning step only—not SharePoint reporting a missing file).",
-                    collisionPath,
+                    "Duplicate mapped path: skipping source \"{Blob}\" — destination \"{Mapped}\" is already claimed by another file.",
+                    record.BlobPath,
                     mapped);
-            }
-            else
-            {
-                seen[mapped] = 0;
+                continue;
             }
 
+            seen.Add(mapped);
             record.MappedPath = mapped;
         }
         return records;
-    }
-
-    private static string AppendDuplicateSuffix(string mappedPath, int duplicateIndex)
-    {
-        var ext = Path.GetExtension(mappedPath);
-        var withoutExt = mappedPath[..^ext.Length];
-        return $"{withoutExt}__dup{duplicateIndex}{ext}";
     }
 
     private static string ResolveSharePointPath(string blobName, string prefix, string sharePointTargetFolder, bool useYyyyCaseNumberPath)
