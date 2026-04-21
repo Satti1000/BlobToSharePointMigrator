@@ -1575,13 +1575,25 @@ public class SharePointMigrationService
         foreach (var caseGroup in caseGroups)
         {
             var caseFolderRelPath = caseGroup.Key;
+            // CaseId / CaseType are the same for every file in a case folder; any group member is fine.
             var rep = caseGroup.First();
             rep.Metadata.TryGetValue("CaseId", out var caseId);
             rep.Metadata.TryGetValue("CaseType", out var caseType);
-            rep.Metadata.TryGetValue("DocumentId", out var documentId);
+            // DocumentId is per file. caseGroup.First() is often case_*_documents.xml (no DocumentId in metadata),
+            // which caused every list item to skip DocumentId — only Wilberforce Case ID / Case Type were set.
+            var documentIdByDestFileName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rec in caseGroup)
+            {
+                if (!rec.Metadata.TryGetValue("DocumentId", out var did) || string.IsNullOrWhiteSpace(did))
+                    continue;
+                var destName = Path.GetFileName((rec.MappedPath ?? string.Empty).Replace('\\', '/').TrimEnd('/'));
+                if (string.IsNullOrWhiteSpace(destName))
+                    destName = rec.Name;
+                documentIdByDestFileName[destName] = did.Trim();
+            }
 
             if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType) &&
-                string.IsNullOrWhiteSpace(documentId))
+                documentIdByDestFileName.Count == 0)
                 continue;
 
             var folderServerRelUrl = $"{rootFolderUrl}/{caseFolderRelPath}";
@@ -1600,7 +1612,8 @@ public class SharePointMigrationService
                     if (pos != null) camlQuery.ListItemCollectionPosition = pos;
 
                     var items = list.GetItems(camlQuery);
-                    _clientContextG.Load(items, ii => ii.ListItemCollectionPosition, ii => ii.Include(x => x.Id));
+                    _clientContextG.Load(items, ii => ii.ListItemCollectionPosition,
+                        ii => ii.Include(x => x.Id, x => x.File, x => x.File.Name));
                     await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
 
                     pending.AddRange(items);
@@ -1609,7 +1622,10 @@ public class SharePointMigrationService
                     // Flush every 100 items to keep each ExecuteQuery batch small.
                     while (pending.Count >= 100)
                     {
-                        await FlushItemBatchAsync(pending.Take(100).ToList(), caseIdField, caseId, caseTypeField, caseType, documentIdField, documentId).ConfigureAwait(false);
+                        await FlushItemBatchWithCaseMetadataAsync(
+                                pending.Take(100).ToList(),
+                                caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                            .ConfigureAwait(false);
                         totalPatched += 100;
                         pending.RemoveRange(0, 100);
                     }
@@ -1619,7 +1635,9 @@ public class SharePointMigrationService
                 // Flush any remainder.
                 if (pending.Count > 0)
                 {
-                    await FlushItemBatchAsync(pending, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentId).ConfigureAwait(false);
+                    await FlushItemBatchWithCaseMetadataAsync(
+                            pending, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                        .ConfigureAwait(false);
                     totalPatched += pending.Count;
                 }
             }
@@ -1636,11 +1654,16 @@ public class SharePointMigrationService
         return totalPatched;
     }
 
-    private async Task FlushItemBatchAsync(
+    /// <summary>
+    /// Applies CaseId / CaseType (shared for the folder) and DocumentId per file using
+    /// <paramref name="documentIdByDestFileName"/> keyed by SharePoint file name (last segment of MappedPath).
+    /// </summary>
+    private async Task FlushItemBatchWithCaseMetadataAsync(
         List<ListItem> items,
         string? caseIdField, string? caseId,
         string? caseTypeField, string? caseType,
-        string? documentIdField, string? documentId)
+        string? documentIdField,
+        IReadOnlyDictionary<string, string> documentIdByDestFileName)
     {
         foreach (var item in items)
         {
@@ -1648,10 +1671,18 @@ public class SharePointMigrationService
                 item[caseIdField] = caseId;
             if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
                 item[caseTypeField] = caseType;
-            if (!string.IsNullOrWhiteSpace(documentIdField) && !string.IsNullOrWhiteSpace(documentId))
-                item[documentIdField] = documentId;
+            if (!string.IsNullOrWhiteSpace(documentIdField) && documentIdByDestFileName.Count > 0)
+            {
+                var spName = item.File?.Name;
+                if (!string.IsNullOrWhiteSpace(spName) &&
+                    documentIdByDestFileName.TryGetValue(spName, out var perFileDocId) &&
+                    !string.IsNullOrWhiteSpace(perFileDocId))
+                    item[documentIdField] = perFileDocId;
+            }
+
             item.SystemUpdate();
         }
+
         await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
     }
 }
