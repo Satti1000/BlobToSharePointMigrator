@@ -1589,6 +1589,7 @@ public class SharePointMigrationService
                 var destName = Path.GetFileName((rec.MappedPath ?? string.Empty).Replace('\\', '/').TrimEnd('/'));
                 if (string.IsNullOrWhiteSpace(destName))
                     destName = rec.Name;
+                destName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(destName);
                 documentIdByDestFileName[destName] = did.Trim();
             }
 
@@ -1674,8 +1675,9 @@ public class SharePointMigrationService
             if (!string.IsNullOrWhiteSpace(documentIdField) && documentIdByDestFileName.Count > 0)
             {
                 var spName = item.File?.Name;
-                if (!string.IsNullOrWhiteSpace(spName) &&
-                    documentIdByDestFileName.TryGetValue(spName, out var perFileDocId) &&
+                var spLookupName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(spName);
+                if (!string.IsNullOrWhiteSpace(spLookupName) &&
+                    documentIdByDestFileName.TryGetValue(spLookupName, out var perFileDocId) &&
                     !string.IsNullOrWhiteSpace(perFileDocId))
                     item[documentIdField] = perFileDocId;
             }

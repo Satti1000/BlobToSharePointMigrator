@@ -196,6 +196,13 @@ public class CaseDocumentMetadataService
         return null;
     }
 
+    /// <summary>
+    /// Normalizes a file name the same way as manifest ↔ blob DocumentId matching (including trailing whitespace
+    /// before a real extension). Use when comparing blob or MappedPath names to SharePoint file names.
+    /// </summary>
+    internal static string NormalizeFileNameForMetadataMatch(string? fileName) =>
+        NormalizeFileNameForMatch(fileName ?? string.Empty);
+
     private static IDictionary<string, string> EnsureMetadataDictionary(FileRecord record)
     {
         record.Metadata ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -240,7 +247,9 @@ public class CaseDocumentMetadataService
 
         foreach (var record in allRecords)
         {
-            if (!IsCaseManifestFile(record.Name))
+            var manifestCanonicalName = NormalizeFileNameForMatch(record.Name ?? string.Empty);
+            var match = CaseManifestRegex.Match(manifestCanonicalName);
+            if (!match.Success)
                 continue;
 
             var caseFolderKey = TryGetCaseDocumentsFolderKey(record.BlobPath);
@@ -248,9 +257,6 @@ public class CaseDocumentMetadataService
                 continue;
 
             var caseNumber = TryExtractCaseNumber(record.BlobPath);
-            var match = CaseManifestRegex.Match(record.Name);
-            if (!match.Success)
-                continue;
 
             var manifestCaseNumber = match.Groups[1].Value;
             if (!string.Equals(caseNumber, manifestCaseNumber, StringComparison.OrdinalIgnoreCase))
@@ -272,7 +278,38 @@ public class CaseDocumentMetadataService
         return string.Join("/", segments.Take(i + 1));
     }
 
-    private static bool IsCaseManifestFile(string fileName) => CaseManifestRegex.IsMatch(fileName ?? string.Empty);
+    private static bool IsCaseManifestFile(string fileName) =>
+        CaseManifestRegex.IsMatch(NormalizeFileNameForMatch(fileName ?? string.Empty));
+
+    /// <summary>
+    /// Parses manifest <c>DocumentDate</c> values; duplicate rows for the same file use the latest date (client rule).
+    /// </summary>
+    private static DateTime? TryParseManifestDocumentDate(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        raw = raw.Trim();
+        if (DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dt))
+            return dt;
+        if (DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))
+            return dt;
+        if (DateTime.TryParse(raw, CultureInfo.CurrentCulture, DateTimeStyles.None, out dt))
+            return dt;
+
+        foreach (var fmt in new[] { "yyyy-MM-dd", "yyyy-MM-ddTHH:mm:ss", "yyyy-MM-ddTHH:mm:ss.fff", "dd/MM/yyyy", "MM/dd/yyyy" })
+        {
+            if (DateTime.TryParseExact(raw, fmt, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))
+                return dt;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<ManifestDocument> OrderManifestCandidatesForAssignment(IEnumerable<ManifestDocument> candidates) =>
+        candidates
+            .OrderByDescending(x => x.DocumentDate ?? DateTime.MinValue)
+            .ThenByDescending(x => x.Sequence);
 
     private sealed class CaseManifestIndex
     {
@@ -307,6 +344,9 @@ public class CaseDocumentMetadataService
                     type: element.Attribute("Type")?.Value?.Trim() ?? string.Empty,
                     category: element.Attribute("Category")?.Value?.Trim() ?? string.Empty,
                     source: element.Attribute("Source")?.Value?.Trim() ?? string.Empty,
+                    documentDate: TryParseManifestDocumentDate(
+                        element.Attribute("DocumentDate")?.Value
+                        ?? element.Element("DocumentDate")?.Value),
                     sequence: index))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Name))
                 .ToList()
@@ -321,24 +361,25 @@ public class CaseDocumentMetadataService
                 .ToList();
 
             var folderDocuments = folderEntries
+                .OrderByDescending(x => x.DocumentDate ?? DateTime.MinValue)
+                .ThenByDescending(x => x.Sequence)
                 .Select(CreateFolderDocument)
                 .Where(x => x != null)
                 .Cast<ManifestFolderDocument>()
-                .OrderBy(x => x.Sequence)
                 .ToList();
 
             var exact = fileEntries
                 .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => g.OrderBy(x => x.Sequence).ToList(),
+                    g => OrderManifestCandidatesForAssignment(g).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
             var normalized = fileEntries
                 .GroupBy(x => x.NormalizedName, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => g.OrderBy(x => x.Sequence).ToList(),
+                    g => OrderManifestCandidatesForAssignment(g).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
             var typed = fileEntries
@@ -346,7 +387,7 @@ public class CaseDocumentMetadataService
                 .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => g.Select(x => x.Document).OrderBy(x => x.Sequence).ToList(),
+                    g => OrderManifestCandidatesForAssignment(g.Select(x => x.Document)).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
             // Stem lookup keys use each entry's NormalizedName (XML names have no file extension). Blob-side
@@ -356,7 +397,7 @@ public class CaseDocumentMetadataService
                 .GroupBy(x => x.NormalizedName, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     g => g.Key,
-                    g => g.OrderBy(x => x.Sequence).ToList(),
+                    g => OrderManifestCandidatesForAssignment(g).ToList(),
                     StringComparer.OrdinalIgnoreCase);
 
             return new CaseManifestIndex(exact, normalized, typed, stems, folderDocuments);
@@ -444,13 +485,21 @@ public class CaseDocumentMetadataService
 
     private sealed class ManifestDocument
     {
-        public ManifestDocument(string id, string name, string type, string category, string source, int sequence)
+        public ManifestDocument(
+            string id,
+            string name,
+            string type,
+            string category,
+            string source,
+            DateTime? documentDate,
+            int sequence)
         {
             Id = id;
             Name = name;
             Type = type;
             Category = category;
             Source = source;
+            DocumentDate = documentDate;
             Sequence = sequence;
             NormalizedName = NormalizeFileNameForMatch(name);
             NormalizedStem = NormalizeFileStemForMatch(name);
@@ -462,6 +511,7 @@ public class CaseDocumentMetadataService
         public string Type { get; }
         public string Category { get; }
         public string Source { get; }
+        public DateTime? DocumentDate { get; }
         public int Sequence { get; }
         public string NormalizedName { get; }
         public string NormalizedStem { get; }
@@ -483,12 +533,42 @@ public class CaseDocumentMetadataService
         public int Sequence { get; }
     }
 
+    private static bool IsRealFileExtension(string extension)
+    {
+        // Expect: starts with '.', followed by 1-6 alphanumeric chars, NOT purely digits.
+        var ext = extension.TrimStart('.');
+        if (ext.Length == 0 || ext.Length > 6)
+            return false;
+        if (!ext.All(char.IsLetterOrDigit))
+            return false;
+        // Purely numeric = version number (.20, .2, .0 ...), not a file extension.
+        return !ext.All(char.IsDigit);
+    }
+
+    /// <summary>
+    /// Blob/manifest names sometimes include a space before the extension (e.g. <c>"title .pdf"</c>), which breaks
+    /// matching against clean XML names. Strip trailing whitespace from the stem only when a real extension follows.
+    /// </summary>
+    private static string TrimTrailingWhitespaceBeforeRealFileExtension(string normalizedFileName)
+    {
+        var extension = Path.GetExtension(normalizedFileName);
+        if (string.IsNullOrWhiteSpace(extension) || !IsRealFileExtension(extension))
+            return normalizedFileName;
+
+        var stem = normalizedFileName[..^extension.Length].TrimEnd();
+        if (stem.Length == 0)
+            return normalizedFileName;
+
+        return stem + extension;
+    }
+
     private static string NormalizeFileNameForMatch(string fileName)
     {
         var normalized = (fileName ?? string.Empty).Normalize(NormalizationForm.FormKC);
         normalized = normalized.Replace('\uFFFD', ' ');
         normalized = normalized.Replace('\\', '/');
         normalized = CollapseWhitespaceRegex.Replace(normalized, " ").Trim().TrimEnd('.');
+        normalized = TrimTrailingWhitespaceBeforeRealFileExtension(normalized);
         return normalized.ToLowerInvariant();
     }
 
@@ -503,19 +583,7 @@ public class CaseDocumentMetadataService
         if (string.IsNullOrWhiteSpace(extension) || !IsRealFileExtension(extension))
             return normalizedName;
 
-        return normalizedName[..^extension.Length].TrimEnd('.');
-    }
-
-    private static bool IsRealFileExtension(string extension)
-    {
-        // Expect: starts with '.', followed by 1-6 alphanumeric chars, NOT purely digits.
-        var ext = extension.TrimStart('.');
-        if (ext.Length == 0 || ext.Length > 6)
-            return false;
-        if (!ext.All(char.IsLetterOrDigit))
-            return false;
-        // Purely numeric = version number (.20, .2, .0 ...), not a file extension.
-        return !ext.All(char.IsDigit);
+        return normalizedName[..^extension.Length].TrimEnd().TrimEnd('.');
     }
 
     private static IReadOnlyCollection<string> BuildExpectedTypedNames(string name, string type)
