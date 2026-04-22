@@ -462,6 +462,8 @@ try
                         // so the report shows the correct path-within-library (no double year).
                         var destPath = StripLibraryPrefix(record.MappedPath, targetLibrary);
 
+                        logger.LogInformation("Destination PAth : {destPath}", destPath);
+
                         var result = new BlobToSharePointMigrator.Models.MigrationResult
                         {
                             SourceFile = record.BlobPath,

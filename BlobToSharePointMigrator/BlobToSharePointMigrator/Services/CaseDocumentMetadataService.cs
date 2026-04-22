@@ -581,6 +581,8 @@ public class CaseDocumentMetadataService
             "application/msword" => new[] { ".doc" },
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => new[] { ".docx" },
             "application/pdf" => new[] { ".pdf" },
+            "text/csv" => new[] { ".csv" },
+            "text/json" => new[] { ".json" },
             "application/vnd.ms-outlook" => new[] { ".msg" },
             "message/rfc822" => new[] { ".eml" },
             "application/vnd.ms-excel" => new[] { ".xls" },
