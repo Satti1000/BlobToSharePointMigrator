@@ -296,6 +296,11 @@ try
 
     var batchesToRun = BuildBatches(toMigrate);
     logger.LogInformation("Submitting {BatchCount} migration job(s) ({Total} files total)...", batchesToRun.Count, toMigrate.Count);
+    logger.LogInformation(
+        "Migration:EnableMigrationJobSaveConflictRetry = {Enabled}. When true, Save Conflict resubmit uses MigrationJobSaveConflictRetries={Retries}, delay {Delay}s.",
+        migrationSettings.EnableMigrationJobSaveConflictRetry,
+        migrationSettings.MigrationJobSaveConflictRetries,
+        migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
 
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var aggregateAlreadyExists = 0;
@@ -385,7 +390,9 @@ try
 
                     var pollIntervalSeconds = Math.Max(1, migrationSettings.JobPollIntervalSeconds);
                     var timeoutMinutes = Math.Max(1, migrationSettings.JobTimeoutMinutes);
-                    var maxSaveConflictRetries = Math.Max(0, migrationSettings.MigrationJobSaveConflictRetries);
+                    var maxSaveConflictRetries = migrationSettings.EnableMigrationJobSaveConflictRetry
+                        ? Math.Max(0, migrationSettings.MigrationJobSaveConflictRetries)
+                        : 0;
                     var retryDelaySec = Math.Max(5, migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
 
                     MigrationJobInfo finalJobInfo = null!;
@@ -421,8 +428,17 @@ try
                     // Batch failure: trust SPMI queue summary. Destination-already-present cases are
                     // classified as non-fatal in SharePointMigrationService (JobFatalError + conflict text)
                     // so Status should not be Failed for those re-runs.
+                    //
+                    // SPMI "Processed" is queue FilesCreated, not a per-file audit. If the job completed with
+                    // errors but processed fewer objects than we submitted, do not mark every blob as
+                    // PartialSuccess — that overstates success vs SharePoint (library counts / failures per file).
+                    var spmiIncomplete =
+                        string.Equals(finalJobInfo.Status, "CompletedWithErrors", StringComparison.OrdinalIgnoreCase) &&
+                        finalJobInfo.ProcessedFileCount < batch.Count;
                     var markAllFailed = finalJobInfo.Status == "Failed" ||
-                                        (finalJobInfo.Status == "CompletedWithErrors" && finalJobInfo.ProcessedFileCount == 0);
+                                        (string.Equals(finalJobInfo.Status, "CompletedWithErrors", StringComparison.OrdinalIgnoreCase) &&
+                                         finalJobInfo.ProcessedFileCount == 0) ||
+                                        spmiIncomplete;
                     var firstError = finalJobInfo.Errors
                         .FirstOrDefault(e =>
                             e.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase) ||
@@ -445,6 +461,8 @@ try
                         // Strip leading "YYYY/" from DestPath/SharePointUrl when YearAsLibrary is active
                         // so the report shows the correct path-within-library (no double year).
                         var destPath = StripLibraryPrefix(record.MappedPath, targetLibrary);
+
+                        logger.LogInformation("Destination PAth : {destPath}", destPath);
 
                         var result = new BlobToSharePointMigrator.Models.MigrationResult
                         {
@@ -472,8 +490,15 @@ try
                         }
                     }
 
-                    logger.LogInformation("Job {Index}/{TotalJobs} complete: Status={Status}, Processed={Processed}/{Total}",
+                    logger.LogInformation(
+                        "Job {Index}/{TotalJobs} complete: Status={Status}, SPMI queue FilesCreated={Processed}/{Total} (SPMI counter — not a SharePoint library file inventory; library totals can differ from earlier runs or folders).",
                         index + 1, batchesToRun.Count, finalJobInfo.Status, finalJobInfo.ProcessedFileCount, finalJobInfo.TotalFileCount);
+                    if (spmiIncomplete)
+                    {
+                        logger.LogWarning(
+                            "Job {Index}/{TotalJobs}: SPMI reported fewer created objects ({Processed}) than files in this batch ({Batch}). Per-file outcomes are not available from the queue; marking all rows Failed for this batch in the CSV/report.",
+                            index + 1, batchesToRun.Count, finalJobInfo.ProcessedFileCount, batch.Count);
+                    }
                 }
                 catch (Exception ex)
                 {
