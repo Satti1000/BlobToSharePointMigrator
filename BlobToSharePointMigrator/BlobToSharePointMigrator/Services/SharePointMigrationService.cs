@@ -18,6 +18,7 @@ using System.Xml.Linq;
 using System.Linq;
 using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
+using SpFile = Microsoft.SharePoint.Client.File;
 
 namespace BlobToSharePointMigrator.Services;
 
@@ -1494,7 +1495,9 @@ public class SharePointMigrationService
 
     /// <summary>
     /// After SPMI jobs complete, patches CaseId, CaseType, and DocumentId (when present on records)
-    /// on SharePoint list items using batched CSOM (100 items per ExecuteQuery).
+    /// on SharePoint list items. Uses <c>GetFileByServerRelativeUrl</c> for each <see cref="FileRecord.MappedPath"/>
+    /// (batched) so the library is not enumerated with CAML — that avoids the list view threshold on large
+    /// document libraries. Only files present in the migration <paramref name="records"/> batch are updated.
     /// </summary>
     /// <param name="records">Records whose Metadata contains CaseId/CaseType/DocumentId values.</param>
     /// <param name="libraryTitle">SharePoint document library title (e.g. "2010").</param>
@@ -1597,50 +1600,30 @@ public class SharePointMigrationService
                 documentIdByDestFileName.Count == 0)
                 continue;
 
-            var folderServerRelUrl = $"{rootFolderUrl}/{caseFolderRelPath}";
+            var fileServerRelativeUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rec in caseGroup)
+            {
+                var url = BuildServerRelativeFileUrlForCaseMetadataPatch(rootFolderUrl, yearPrefixToStrip, rec);
+                if (!string.IsNullOrEmpty(url))
+                    fileServerRelativeUrls.Add(url);
+            }
+
+            if (fileServerRelativeUrls.Count == 0)
+            {
+                _logger.LogWarning(
+                    "Could not build server-relative file URL(s) for case folder '{Folder}' in library '{Library}'; metadata patch skipped for this group.",
+                    caseFolderRelPath, libraryTitle);
+                totalFoldersFailed++;
+                continue;
+            }
+
             try
             {
-                var pending = new List<ListItem>();
-                ListItemCollectionPosition? pos = null;
-
-                do
-                {
-                    var camlQuery = new CamlQuery
-                    {
-                        FolderServerRelativeUrl = folderServerRelUrl,
-                        ViewXml = "<View Scope='FilesOnly'><RowLimit>100</RowLimit></View>"
-                    };
-                    if (pos != null) camlQuery.ListItemCollectionPosition = pos;
-
-                    var items = list.GetItems(camlQuery);
-                    _clientContextG.Load(items, ii => ii.ListItemCollectionPosition,
-                        ii => ii.Include(x => x.Id, x => x.File, x => x.File.Name));
-                    await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
-
-                    pending.AddRange(items);
-                    pos = items.ListItemCollectionPosition;
-
-                    // Flush every 100 items to keep each ExecuteQuery batch small.
-                    while (pending.Count >= 100)
-                    {
-                        await FlushItemBatchWithCaseMetadataAsync(
-                                pending.Take(100).ToList(),
-                                caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
-                            .ConfigureAwait(false);
-                        totalPatched += 100;
-                        pending.RemoveRange(0, 100);
-                    }
-                }
-                while (pos != null);
-
-                // Flush any remainder.
-                if (pending.Count > 0)
-                {
-                    await FlushItemBatchWithCaseMetadataAsync(
-                            pending, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
-                        .ConfigureAwait(false);
-                    totalPatched += pending.Count;
-                }
+                var patched = await PatchCaseMetadataOnFilesByServerRelativeUrlAsync(
+                        fileServerRelativeUrls,
+                        caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                    .ConfigureAwait(false);
+                totalPatched += patched;
             }
             catch (Exception ex)
             {
@@ -1655,36 +1638,324 @@ public class SharePointMigrationService
         return totalPatched;
     }
 
+    private static string? BuildServerRelativeFileUrlForCaseMetadataPatch(
+        string listRootUrl,
+        string? yearPrefixToStrip,
+        FileRecord record)
+    {
+        var rel = (record.MappedPath ?? string.Empty).Replace('\\', '/').Trim();
+        if (string.IsNullOrEmpty(rel) || rel == "/")
+        {
+            if (string.IsNullOrWhiteSpace(record.Name))
+                return null;
+            rel = record.Name;
+        }
+        else
+        {
+            rel = rel.TrimStart('/');
+        }
+
+        if (!string.IsNullOrEmpty(yearPrefixToStrip))
+        {
+            var p = yearPrefixToStrip.TrimEnd('/') + "/";
+            if (rel.StartsWith(p, StringComparison.OrdinalIgnoreCase))
+                rel = rel[p.Length..];
+        }
+
+        rel = rel.Replace("//", "/").Trim().TrimStart('/');
+        if (string.IsNullOrEmpty(rel))
+            return null;
+
+        return $"{listRootUrl.TrimEnd('/')}/{rel}";
+    }
+
     /// <summary>
-    /// Applies CaseId / CaseType (shared for the folder) and DocumentId per file using
-    /// <paramref name="documentIdByDestFileName"/> keyed by SharePoint file name (last segment of MappedPath).
+    /// Loads list items for known file URLs (avoids CAML on the whole list/folder) and applies metadata.
     /// </summary>
-    private async Task FlushItemBatchWithCaseMetadataAsync(
-        List<ListItem> items,
+    private async Task<int> PatchCaseMetadataOnFilesByServerRelativeUrlAsync(
+        IReadOnlyCollection<string> fileServerRelativeUrls,
         string? caseIdField, string? caseId,
         string? caseTypeField, string? caseType,
         string? documentIdField,
         IReadOnlyDictionary<string, string> documentIdByDestFileName)
     {
-        foreach (var item in items)
-        {
-            if (!string.IsNullOrWhiteSpace(caseIdField) && !string.IsNullOrWhiteSpace(caseId))
-                item[caseIdField] = caseId;
-            if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
-                item[caseTypeField] = caseType;
-            if (!string.IsNullOrWhiteSpace(documentIdField) && documentIdByDestFileName.Count > 0)
-            {
-                var spName = item.File?.Name;
-                var spLookupName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(spName);
-                if (!string.IsNullOrWhiteSpace(spLookupName) &&
-                    documentIdByDestFileName.TryGetValue(spLookupName, out var perFileDocId) &&
-                    !string.IsNullOrWhiteSpace(perFileDocId))
-                    item[documentIdField] = perFileDocId;
-            }
+        // Smaller shell batches reduce pressure on large libraries (LVT can still hit wide GetFile batches).
+        const int batchSize = 25;
+        var urls = fileServerRelativeUrls.ToList();
+        var patched = 0;
 
-            item.SystemUpdate();
+        for (var i = 0; i < urls.Count; i += batchSize)
+        {
+            var batch = urls.Skip(i).Take(batchSize).ToList();
+            try
+            {
+                patched += await LoadAndSystemUpdateOneBatchAsync(
+                        batch, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (batch.Count <= 1)
+                    throw;
+
+                _logger.LogDebug(ex, "Batched file load for metadata patch failed; retrying {Count} file(s) individually.", batch.Count);
+                foreach (var u in batch)
+                {
+                    try
+                    {
+                        patched += await LoadAndSystemUpdateOneBatchAsync(
+                                new[] { u }, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception ex2)
+                    {
+                        _logger.LogWarning(ex2, "Metadata patch failed for file '{FileUrl}'.", u);
+                    }
+                }
+            }
         }
 
+        return patched;
+    }
+
+    private static bool IsListViewThresholdException(Exception ex)
+    {
+        for (var e = ex; e != null; e = e.InnerException)
+        {
+            if (e is ServerException se &&
+                se.Message.Contains("list view threshold", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private async Task LoadListItemAllFieldsForFilesAsync(IReadOnlyList<SpFile> filesToLoad)
+    {
+        if (filesToLoad.Count == 0)
+            return;
+
+        const int chunk = 2;
+        for (var i = 0; i < filesToLoad.Count;)
+        {
+            var remaining = filesToLoad.Count - i;
+            var take = Math.Min(chunk, remaining);
+            var slice = new List<SpFile>(take);
+            for (var k = 0; k < take; k++)
+                slice.Add(filesToLoad[i + k]);
+
+            var loaded = await TryLoadListItemAllFieldsSliceAsync(slice).ConfigureAwait(false);
+            if (loaded)
+            {
+                i += take;
+                continue;
+            }
+
+            foreach (var f in slice)
+            {
+                if (await TryLoadListItemAllFieldsSingleAsync(f).ConfigureAwait(false))
+                    continue;
+            }
+
+            i += take;
+        }
+    }
+
+    private async Task<bool> TryLoadListItemAllFieldsSliceAsync(IReadOnlyList<SpFile> slice)
+    {
+        if (slice.Count == 0)
+            return true;
+
+        try
+        {
+            foreach (var f in slice)
+                _clientContextG.Load(f, x => x.ListItemAllFields);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "Batch list item load failed for {Count} file(s); will retry with smaller or single request.",
+                slice.Count);
+            return false;
+        }
+    }
+
+    private async Task<bool> TryLoadListItemAllFieldsSingleAsync(SpFile f)
+    {
+        try
+        {
+            _clientContextG.Load(f, x => x.ListItemAllFields);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (IsListViewThresholdException(ex))
+        {
+            _logger.LogWarning(ex,
+                "List view threshold: could not load list item for a file. Skipping this file in metadata patch.");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not load list item for a file. Skipping this file in metadata patch.");
+            return false;
+        }
+    }
+
+    private async Task<int> LoadAndSystemUpdateOneBatchAsync(
+        IReadOnlyList<string> fileServerRelativeUrls,
+        string? caseIdField, string? caseId,
+        string? caseTypeField, string? caseType,
+        string? documentIdField,
+        IReadOnlyDictionary<string, string> documentIdByDestFileName)
+    {
+        // Do not request ListItemAllFields with large multi-file GetFile requests in a single
+        // Execute — that can still trip the list view threshold on very large document libraries.
+        var files = new List<SpFile>(fileServerRelativeUrls.Count);
+        foreach (var rel in fileServerRelativeUrls)
+        {
+            var f = _web.GetFileByServerRelativeUrl(rel);
+            _clientContextG.Load(f, x => x.Exists, x => x.Name);
+            files.Add(f);
+        }
+
+        try
+        {
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsListViewThresholdException(ex) && fileServerRelativeUrls.Count > 1)
+        {
+            _logger.LogDebug(ex, "LVT loading file metadata shells in batch; retrying per URL.");
+            return await LoadAndSystemUpdateOneFileAtATimeAsync(
+                    fileServerRelativeUrls, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsListViewThresholdException(ex) && fileServerRelativeUrls.Count == 1)
+        {
+            _logger.LogDebug(ex, "LVT loading a single file shell; retrying with split load+update request.");
+            return await LoadAndSystemUpdateOneFileAtATimeAsync(
+                    fileServerRelativeUrls, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
+                .ConfigureAwait(false);
+        }
+
+        var existing = new List<SpFile>(files.Count);
+        for (var j = 0; j < files.Count; j++)
+        {
+            var f = files[j];
+            if (f.Exists)
+            {
+                existing.Add(f);
+                continue;
+            }
+
+            _logger.LogDebug("File not found at server-relative path; metadata patch skipped: {FileUrl}.", fileServerRelativeUrls[j]);
+        }
+
+        if (existing.Count == 0)
+            return 0;
+
+        await LoadListItemAllFieldsForFilesAsync(existing).ConfigureAwait(false);
+
+        var patched = 0;
+        foreach (var f in existing)
+        {
+            var item = f.ListItemAllFields;
+            if (item is null)
+                continue;
+
+            ApplyCaseMetadataToListItem(
+                item, f.Name, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName);
+            patched++;
+        }
+
+        if (patched == 0)
+            return 0;
+
         await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+        return patched;
+    }
+
+    private async Task<int> LoadAndSystemUpdateOneFileAtATimeAsync(
+        IReadOnlyList<string> fileServerRelativeUrls,
+        string? caseIdField, string? caseId,
+        string? caseTypeField, string? caseType,
+        string? documentIdField,
+        IReadOnlyDictionary<string, string> documentIdByDestFileName)
+    {
+        var patched = 0;
+        foreach (var rel in fileServerRelativeUrls)
+        {
+            var f = _web.GetFileByServerRelativeUrl(rel);
+            _clientContextG.Load(f, x => x.Exists, x => x.Name);
+            try
+            {
+                await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Metadata patch: failed loading file info for '{FileUrl}'.", rel);
+                continue;
+            }
+
+            if (!f.Exists)
+                continue;
+
+            _clientContextG.Load(f, x => x.ListItemAllFields);
+            try
+            {
+                await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsListViewThresholdException(ex))
+            {
+                _logger.LogWarning(ex, "Metadata patch: list view threshold loading list item for '{FileUrl}'.", rel);
+                continue;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Metadata patch: failed loading list item for '{FileUrl}'.", rel);
+                continue;
+            }
+
+            if (f.ListItemAllFields is null)
+                continue;
+
+            ApplyCaseMetadataToListItem(
+                f.ListItemAllFields, f.Name, caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName);
+            try
+            {
+                await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+                patched++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Metadata patch SystemUpdate failed for file '{FileUrl}'.", rel);
+            }
+        }
+
+        return patched;
+    }
+
+    private static void ApplyCaseMetadataToListItem(
+        ListItem item,
+        string? fileName,
+        string? caseIdField, string? caseId,
+        string? caseTypeField, string? caseType,
+        string? documentIdField,
+        IReadOnlyDictionary<string, string> documentIdByDestFileName)
+    {
+        if (!string.IsNullOrWhiteSpace(caseIdField) && !string.IsNullOrWhiteSpace(caseId))
+            item[caseIdField] = caseId;
+        if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
+            item[caseTypeField] = caseType;
+        if (!string.IsNullOrWhiteSpace(documentIdField) && documentIdByDestFileName.Count > 0)
+        {
+            var spLookupName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(fileName);
+            if (!string.IsNullOrWhiteSpace(spLookupName) &&
+                documentIdByDestFileName.TryGetValue(spLookupName, out var perFileDocId) &&
+                !string.IsNullOrWhiteSpace(perFileDocId))
+                item[documentIdField] = perFileDocId;
+        }
+
+        item.SystemUpdate();
     }
 }
