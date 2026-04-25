@@ -8,6 +8,12 @@ public class MigrationSettings
     public string SharePointClientId        { get; set; } = string.Empty;
     public string SharePointClientSecret    { get; set; } = string.Empty;
     public string SharePointSiteUrl         { get; set; } = string.Empty;
+    /// <summary>SharePoint admin center URL; used to derive tenant name for logging (e.g. https://contoso-admin.sharepoint.com).</summary>
+    public string AdminUrl                  { get; set; } = string.Empty;
+    /// <summary>Document library column display names for CaseId / CaseType / DocumentId (field resolution in SharePoint).</summary>
+    public string SharePointCaseIdColumnDisplayName     { get; set; } = string.Empty;
+    public string SharePointCaseTypeColumnDisplayName   { get; set; } = string.Empty;
+    public string SharePointDocumentIdColumnDisplayName { get; set; } = string.Empty;
     public string SharePointDocumentLibrary { get; set; } = "Documents";
     public List<string> AllowedExtensions   { get; set; } = new() { ".pdf", ".csv", ".html", ".txt", ".xml" };
     public string MappingFile               { get; set; } = "mapping.json";

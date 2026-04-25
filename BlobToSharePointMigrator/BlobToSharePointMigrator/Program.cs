@@ -35,12 +35,8 @@ var migrationSection = config.GetSection("Migration");
 if (!migrationSection.Exists())
     throw new InvalidOperationException("'Migration' section was not found in appsettings.json");
 
-var settings = config.GetSection("SimpleETL");
-if (!settings.Exists())
-    throw new InvalidOperationException("'SimpleETL' section was not found in appsettings.json");
-
 var migrationSettings = migrationSection.Get<MigrationSettings>()
-    ?? throw new InvalidOperationException("Migration settings could not be bound from 'Migration' or 'SimpleETL' section.");
+    ?? throw new InvalidOperationException("Migration settings could not be bound from the 'Migration' section.");
 
 var services = new ServiceCollection()
     .AddLogging(b => b
@@ -51,14 +47,14 @@ var services = new ServiceCollection()
 
 var loggerFactory = services.GetRequiredService<ILoggerFactory>();
 
-var blobService = new BlobInventoryService(settings, migrationSettings, loggerFactory.CreateLogger<BlobInventoryService>());
+var blobService = new BlobInventoryService(migrationSettings, loggerFactory.CreateLogger<BlobInventoryService>());
 var transformSvc = new PathTransformService(
     Path.Combine(AppContext.BaseDirectory, migrationSettings.MappingFile),
     migrationSettings.UseYyyyCaseNumberPath,
     loggerFactory.CreateLogger<PathTransformService>(),
     migrationSettings.BlobFolderPrefix,
     migrationSettings.SharePointTargetFolder);
-var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+var spServiceProbe = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 var caseMetadataSvc = new CaseDocumentMetadataService(migrationSettings, loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
@@ -359,7 +355,7 @@ try
                         sampleFile,
                         targetLibrary);
                     // Use isolated service/context per concurrent batch to avoid shared-state contention.
-                    var batchSpService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+                    var batchSpService = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
                     await batchSpService.ConnectAsync();
                     // If using Year-as-Library, strip leading "YYYY/" from mapped paths for this batch
                     var batchForSubmit = batch;
@@ -555,7 +551,7 @@ try
         }
         else
         {
-            var metaService = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+            var metaService = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
             await metaService.ConnectAsync();
 
             if (migrationSettings.YearAsLibrary)

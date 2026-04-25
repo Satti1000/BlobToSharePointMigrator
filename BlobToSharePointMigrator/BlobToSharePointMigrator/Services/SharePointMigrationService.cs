@@ -4,7 +4,6 @@ using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
 using BlobToSharePointMigrator.Configuration;
 using BlobToSharePointMigrator.Models;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Identity.Client;
 using Microsoft.SharePoint.Client;
@@ -36,7 +35,6 @@ namespace BlobToSharePointMigrator.Services;
 public class SharePointMigrationService
 {
     private readonly MigrationSettings _settings;
-    private IConfigurationSection _processFlags;
     private readonly ILogger<SharePointMigrationService> _logger;
     private ClientContext _clientContextG = null!;
     private Site _site = null!;
@@ -55,19 +53,18 @@ public class SharePointMigrationService
     private int _lastQueueErrors = -1;
     private DateTime _lastQueueProgressLogUtc = DateTime.MinValue;
 
-    public SharePointMigrationService(IConfigurationSection processFlags, MigrationSettings settings, ILogger<SharePointMigrationService> logger)
+    public SharePointMigrationService(MigrationSettings settings, ILogger<SharePointMigrationService> logger)
     {
         _settings = settings;
         _logger = logger;
-        _processFlags = processFlags;
         _effectiveMetadataFieldMap = new Dictionary<string, string>(_settings.MetadataFieldMap, StringComparer.OrdinalIgnoreCase);
     }
 
     private string GetTenantName()
     {
-        var url = _processFlags.GetSection("AdminUrl").Value;
+        var url = _settings.AdminUrl?.Trim();
         if (string.IsNullOrWhiteSpace(url))
-            throw new InvalidOperationException("AdminUrl is not configured under SimpleETL:AdminUrl.");
+            throw new InvalidOperationException("AdminUrl is not configured. Set Migration:AdminUrl.");
         return new Uri(url).Host.Split('.')[0];
     }
 
@@ -81,12 +78,9 @@ public class SharePointMigrationService
         try
         {
             // Prefer certificate-based app-only auth for CSOM + SPMI (matches README + avoids scope/audience mistakes).
-            var siteUrl = _processFlags.GetSection("SHAREPOINT_SITE_URL").Value?.Trim();
+            var siteUrl = _settings.SharePointSiteUrl?.Trim();
             if (string.IsNullOrWhiteSpace(siteUrl))
-                siteUrl = _settings.SharePointSiteUrl?.Trim();
-
-            if (string.IsNullOrWhiteSpace(siteUrl))
-                throw new InvalidOperationException("SharePoint site url not configured. Set SimpleETL:SHAREPOINT_SITE_URL or Migration:SharePointSiteUrl.");
+                throw new InvalidOperationException("SharePoint site url not configured. Set Migration:SharePointSiteUrl.");
 
             _logger.LogInformation("Connecting to SharePoint (PnP.Framework CSOM app-only): {Url}", siteUrl);
 
@@ -1344,7 +1338,7 @@ public class SharePointMigrationService
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            // Create/resolve columns for configured SimpleETL display names even when no file had that
+            // Create/resolve columns for configured Migration display names even when no file had that
             // metadata key this run (e.g. DocumentId not in XML — otherwise "Document ID" column was never ensured).
             var keysToResolve = new HashSet<string>(requiredKeys, StringComparer.OrdinalIgnoreCase);
             foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId" })
@@ -1362,7 +1356,7 @@ public class SharePointMigrationService
             if (extrasConfigured.Count > 0)
             {
                 _logger.LogInformation(
-                    "Ensuring SharePoint list columns for metadata keys configured in SimpleETL but absent on all records this run: {Keys} (library '{Library}').",
+                    "Ensuring SharePoint list columns for metadata keys configured in Migration but absent on all records this run: {Keys} (library '{Library}').",
                     string.Join(", ", extrasConfigured),
                     libraryTitle);
             }
@@ -1428,11 +1422,17 @@ public class SharePointMigrationService
     private string? GetMetadataDisplayName(string metadataKey)
     {
         if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase))
-            return _processFlags.GetSection("SHAREPOINT_CASEID_COLUMN_DISPLAY_NAME").Value;
+            return string.IsNullOrWhiteSpace(_settings.SharePointCaseIdColumnDisplayName)
+                ? null
+                : _settings.SharePointCaseIdColumnDisplayName;
         if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
-            return _processFlags.GetSection("SHAREPOINT_CASETYPE_COLUMN_DISPLAY_NAME").Value;
+            return string.IsNullOrWhiteSpace(_settings.SharePointCaseTypeColumnDisplayName)
+                ? null
+                : _settings.SharePointCaseTypeColumnDisplayName;
         if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
-            return _processFlags.GetSection("SHAREPOINT_DOCUMENTID_COLUMN_DISPLAY_NAME").Value;
+            return string.IsNullOrWhiteSpace(_settings.SharePointDocumentIdColumnDisplayName)
+                ? null
+                : _settings.SharePointDocumentIdColumnDisplayName;
 
         return null;
     }

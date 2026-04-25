@@ -2,7 +2,6 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using BlobToSharePointMigrator.Configuration;
 using BlobToSharePointMigrator.Models;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Text.RegularExpressions;
 
@@ -11,16 +10,14 @@ namespace BlobToSharePointMigrator.Services;
 public class BlobInventoryService
 {
     private readonly MigrationSettings _settings;
-    private IConfigurationSection _processFlags;
     private readonly ILogger<BlobInventoryService> _logger;
     private readonly BlobServiceClient _blobServiceClient;
 
-    public BlobInventoryService(IConfigurationSection processFlags, MigrationSettings settings, ILogger<BlobInventoryService> logger)
+    public BlobInventoryService(MigrationSettings settings, ILogger<BlobInventoryService> logger)
     {
         _settings = settings;
         _logger = logger;
         _blobServiceClient = new BlobServiceClient(settings.BlobConnectionString);
-        _processFlags = processFlags;
     }
 
     public async Task<List<FileRecord>> InventoryAsync()
@@ -33,8 +30,7 @@ public class BlobInventoryService
         var records = new List<FileRecord>();
         var allowedExtensions = new HashSet<string>(_settings.AllowedExtensions, StringComparer.OrdinalIgnoreCase);
         var requiredCountByYearAndCaseType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var blobFolderPrefix = _processFlags.GetSection("BlobFolderPrefix").Value;
-        var prefix = blobFolderPrefix?.TrimEnd('/') ?? "";
+        var prefix = (_settings.BlobFolderPrefix ?? string.Empty).TrimEnd('/');
         var basePrefix = string.IsNullOrEmpty(prefix) ? string.Empty : prefix + "/";
 
         var candidatePrefixes = await BuildTargetPrefixesAsync(containerClient, basePrefix);
