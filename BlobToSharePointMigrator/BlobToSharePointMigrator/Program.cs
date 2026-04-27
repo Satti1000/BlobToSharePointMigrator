@@ -297,6 +297,9 @@ try
         migrationSettings.EnableMigrationJobSaveConflictRetry,
         migrationSettings.MigrationJobSaveConflictRetries,
         migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
+    logger.LogInformation(
+        "Migration:TreatIncompleteSpmiBatchAsPartialSuccessForMetadata = {Enabled}. When true, CompletedWithErrors + FilesCreated below batch size (without Save Conflict) still yields PartialSuccess so STEP 5 metadata patch runs.",
+        migrationSettings.TreatIncompleteSpmiBatchAsPartialSuccessForMetadata);
 
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var aggregateAlreadyExists = 0;
@@ -431,10 +434,26 @@ try
                     var spmiIncomplete =
                         string.Equals(finalJobInfo.Status, "CompletedWithErrors", StringComparison.OrdinalIgnoreCase) &&
                         finalJobInfo.ProcessedFileCount < batch.Count;
-                    var markAllFailed = finalJobInfo.Status == "Failed" ||
-                                        (string.Equals(finalJobInfo.Status, "CompletedWithErrors", StringComparison.OrdinalIgnoreCase) &&
-                                         finalJobInfo.ProcessedFileCount == 0) ||
-                                        spmiIncomplete;
+                    var hardBatchFailed = finalJobInfo.Status == "Failed" ||
+                        (string.Equals(finalJobInfo.Status, "CompletedWithErrors", StringComparison.OrdinalIgnoreCase) &&
+                         finalJobInfo.ProcessedFileCount == 0);
+                    var saveConflictBatch = MigrationJobHasSaveConflictErrors(finalJobInfo);
+                    var treatIncompleteAsPartialForMetadata =
+                        migrationSettings.TreatIncompleteSpmiBatchAsPartialSuccessForMetadata &&
+                        spmiIncomplete &&
+                        !hardBatchFailed &&
+                        !saveConflictBatch;
+                    if (treatIncompleteAsPartialForMetadata)
+                    {
+                        logger.LogWarning(
+                            "Job {Index}/{TotalJobs}: SPMI FilesCreated={Processed} is below batch size {Batch}; TreatIncompleteSpmiBatchAsPartialSuccessForMetadata=true — marking rows PartialSuccess so metadata patch (DocumentId, etc.) still runs. Confirm SharePoint outcomes before relying on CSV status.",
+                            index + 1,
+                            batchesToRun.Count,
+                            finalJobInfo.ProcessedFileCount,
+                            batch.Count);
+                    }
+
+                    var markAllFailed = hardBatchFailed || (spmiIncomplete && !treatIncompleteAsPartialForMetadata);
                     var firstError = finalJobInfo.Errors
                         .FirstOrDefault(e =>
                             e.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase) ||
@@ -489,10 +508,10 @@ try
                     logger.LogInformation(
                         "Job {Index}/{TotalJobs} complete: Status={Status}, SPMI queue FilesCreated={Processed}/{Total} (SPMI counter — not a SharePoint library file inventory; library totals can differ from earlier runs or folders).",
                         index + 1, batchesToRun.Count, finalJobInfo.Status, finalJobInfo.ProcessedFileCount, finalJobInfo.TotalFileCount);
-                    if (spmiIncomplete)
+                    if (spmiIncomplete && !treatIncompleteAsPartialForMetadata)
                     {
                         logger.LogWarning(
-                            "Job {Index}/{TotalJobs}: SPMI reported fewer created objects ({Processed}) than files in this batch ({Batch}). Per-file outcomes are not available from the queue; marking all rows Failed for this batch in the CSV/report.",
+                            "Job {Index}/{TotalJobs}: SPMI reported fewer created objects ({Processed}) than files in this batch ({Batch}). Per-file outcomes are not available from the queue; marking all rows Failed for this batch in the CSV/report. Set Migration:TreatIncompleteSpmiBatchAsPartialSuccessForMetadata=true (and ensure no Save Conflict) if reruns should still refresh DocumentId via STEP 5.",
                             index + 1, batchesToRun.Count, finalJobInfo.ProcessedFileCount, batch.Count);
                     }
                 }

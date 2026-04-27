@@ -37,6 +37,15 @@ public class MigrationSettings
     public int MigrationJobSaveConflictRetries { get; set; } = 1;
     public int MigrationJobSaveConflictRetryDelaySeconds { get; set; } = 45;
 
+    /// <summary>
+    /// When true, a batch that finishes with <c>CompletedWithErrors</c> and SPMI <c>FilesCreated</c> below the
+    /// submitted file count (incomplete vs queue counter) is still marked <c>PartialSuccess</c> so STEP 5 can
+    /// refresh CaseId / CaseType / DocumentId on destination paths. Use for reruns where SharePoint may have
+    /// updated or skipped objects without matching the queue "created" count. Not used when the job status is
+    /// <c>Failed</c> or when Save Conflict diagnostics are present (those batches stay all-Failed).
+    /// </summary>
+    public bool TreatIncompleteSpmiBatchAsPartialSuccessForMetadata { get; set; } = false;
+
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName
     public string BlobFolderPrefix          { get; set; } = string.Empty; // optional source filter
     public int MigrationYear                { get; set; } = 0;            // 0 = all years

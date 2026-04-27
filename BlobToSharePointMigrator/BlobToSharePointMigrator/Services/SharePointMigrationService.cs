@@ -1145,6 +1145,7 @@ public class SharePointMigrationService
                     new XAttribute("ParentWebId", _webId),
                     new XAttribute("ParentWebUrl", webUrl),
                     new XAttribute("Name", fileName),
+                    // 0 = import assigns list id; stable File Id above still maps successive runs to the same SPFile for in-place updates.
                     new XAttribute("ListItemIntId", "0"),
                     new XAttribute("ListId", _listId),
                     new XAttribute("ParentId", fileParentId),
