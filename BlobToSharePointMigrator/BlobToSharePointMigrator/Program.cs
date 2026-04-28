@@ -139,6 +139,19 @@ static bool MigrationJobHasSaveConflictErrors(MigrationJobInfo info)
     return false;
 }
 
+static string ExtractCaseFolderFromMappedPath(string? mappedPath)
+{
+    var path = (mappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+    var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (segs.Length >= 2 && Regex.IsMatch(segs[0], "^\\d{4}$") && Regex.IsMatch(segs[1], "^\\d+$"))
+        return $"{segs[0]}/{segs[1]}";
+    if (segs.Length >= 2)
+        return $"{segs[0]}/{segs[1]}";
+    if (segs.Length == 1)
+        return segs[0];
+    return string.Empty;
+}
+
 try
 {
     logger.LogInformation("Running startup configuration precheck...");
@@ -304,6 +317,7 @@ try
     var allResults = new List<BlobToSharePointMigrator.Models.MigrationResult>();
     var aggregateAlreadyExists = 0;
     var aggregateOtherErrors = 0;
+    var batchAuditBySourceFile = new ConcurrentDictionary<string, (bool AlreadyExistsSignal, string JobStatus, int FilesCreated, int SubmittedCount, string Note)>(StringComparer.OrdinalIgnoreCase);
     var deltaLock = new object();
 
     // Run with limited parallelism across batches; also serialize SPMI jobs that target the same
@@ -454,6 +468,10 @@ try
                     }
 
                     var markAllFailed = hardBatchFailed || (spmiIncomplete && !treatIncompleteAsPartialForMetadata);
+                    var batchAlreadyExistsSignal = finalJobInfo.AlreadyExistsCount > 0;
+                    var batchAuditNote = batchAlreadyExistsSignal
+                        ? "SPMI queue reported destination already-exists signal(s); treat as overwrite/replacement intent."
+                        : "No destination already-exists signal reported for this batch.";
                     var firstError = finalJobInfo.Errors
                         .FirstOrDefault(e =>
                             e.Contains("JobFatalError", StringComparison.OrdinalIgnoreCase) ||
@@ -465,6 +483,13 @@ try
 
                     foreach (var record in batch)
                     {
+                        batchAuditBySourceFile[record.BlobPath] = (
+                            batchAlreadyExistsSignal,
+                            finalJobInfo.Status,
+                            finalJobInfo.ProcessedFileCount,
+                            batch.Count,
+                            batchAuditNote);
+
                         var rowStatus = markAllFailed
                             ? "Failed"
                             : finalJobInfo.Status == "Completed"
@@ -597,8 +622,45 @@ try
         }
     }
 
+    var lastResultBySource = allResults
+        .GroupBy(r => r.SourceFile, StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
+    var overwriteAuditRows = toMigrate
+        .Select(record =>
+        {
+            lastResultBySource.TryGetValue(record.BlobPath, out var result);
+            batchAuditBySourceFile.TryGetValue(record.BlobPath, out var audit);
+            var caseFolder = ExtractCaseFolderFromMappedPath(record.MappedPath);
+            var year = caseFolder.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+            var documentIdPresent = record.Metadata.TryGetValue("DocumentId", out var did) && !string.IsNullOrWhiteSpace(did);
+            var metadataPatchEligible = result?.Status is "Success" or "PartialSuccess";
+            var note = audit.Note;
+            if (!documentIdPresent)
+                note = string.IsNullOrWhiteSpace(note) ? "DocumentId missing after manifest matching." : $"{note} DocumentId missing after manifest matching.";
+
+            return new OverwriteAuditRow
+            {
+                SourceFile = record.BlobPath,
+                DestPath = result?.DestPath ?? record.MappedPath,
+                CaseFolder = caseFolder,
+                Year = year,
+                Status = result?.Status ?? "NotSubmitted",
+                DocumentIdPresent = documentIdPresent,
+                MetadataPatchEligible = metadataPatchEligible,
+                BatchAlreadyExistsSignal = audit.AlreadyExistsSignal,
+                BatchJobStatus = audit.JobStatus ?? string.Empty,
+                BatchFilesCreated = audit.FilesCreated,
+                BatchSubmittedCount = audit.SubmittedCount,
+                Notes = note
+            };
+        })
+        .OrderBy(r => r.CaseFolder, StringComparer.OrdinalIgnoreCase)
+        .ThenBy(r => r.DestPath, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);
+    reportSvc.WriteOverwriteAuditReport(overwriteAuditRows);
     reportSvc.WriteFailedItems(allResults);
     // Recompute estimated case-folder count for summary
     var estimatedCaseFolders = 0;

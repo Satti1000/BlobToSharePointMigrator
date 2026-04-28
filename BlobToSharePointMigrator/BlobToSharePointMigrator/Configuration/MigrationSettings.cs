@@ -19,6 +19,7 @@ public class MigrationSettings
     public string MappingFile               { get; set; } = "mapping.json";
     public string LogFile                   { get; set; } = "migration-log.txt";
     public string ReportFile                { get; set; } = "migration-report.csv";
+    public string OverwriteAuditReportFile  { get; set; } = "overwrite-audit.csv";
     public string DeltaTrackingFile         { get; set; } = "migrated-files.json";
     public bool   DeltaMode                 { get; set; } = false;
 	public string SharePointCertificatePath        { get; set; } = string.Empty;

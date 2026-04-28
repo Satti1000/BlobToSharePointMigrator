@@ -78,6 +78,22 @@ public class ReportService
             _settings.FailedItemsFile, failed.Count);
     }
 
+    public void WriteOverwriteAuditReport(List<OverwriteAuditRow> rows)
+    {
+        using var writer = new StreamWriter(_settings.OverwriteAuditReportFile);
+        using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
+        csv.WriteRecords(rows);
+
+        var overwriteSignalRows = rows.Count(r => r.BatchAlreadyExistsSignal);
+        var patchedEligible = rows.Count(r => r.MetadataPatchEligible);
+        _logger.LogInformation(
+            "Overwrite audit report saved: {File} ({Count} rows, overwrite-signaled rows={OverwriteSignalRows}, metadata-patch-eligible rows={PatchedEligibleRows})",
+            _settings.OverwriteAuditReportFile,
+            rows.Count,
+            overwriteSignalRows,
+            patchedEligible);
+    }
+
     public HashSet<string> LoadFailedSourceFiles()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -133,6 +149,7 @@ public class ReportService
         lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");
         lines.AppendLine("======================================================");
         lines.AppendLine($"  Report saved:      {_settings.ReportFile}");
+        lines.AppendLine($"  Overwrite audit:   {_settings.OverwriteAuditReportFile}");
         lines.AppendLine($"  Failed-items file: {_settings.FailedItemsFile}");
         lines.Append    ("======================================================");
 
