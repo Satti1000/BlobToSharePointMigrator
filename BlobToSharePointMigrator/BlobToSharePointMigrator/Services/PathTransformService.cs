@@ -151,9 +151,10 @@ public class PathTransformService
     private static string? TransformToYyyyCaseNumberPath(string blobPath)
     {
         var segments = CaseDocumentsPathRules.SplitPathSegments(blobPath);
-        if (segments.Length < 3) return null;
+        if (segments.Length < 3)
+            return null;
 
-        string? year = segments[2];
+        var year = CaseDocumentsPathRules.TryGetAlignedYear(blobPath);
         var documentsIndex = CaseDocumentsPathRules.FindAlignedDocumentsSegmentIndex(segments);
         string? caseNumber = null;
         if (documentsIndex >= 0)

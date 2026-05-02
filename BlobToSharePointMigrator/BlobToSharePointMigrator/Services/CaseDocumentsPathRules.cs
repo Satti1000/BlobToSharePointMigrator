@@ -10,6 +10,7 @@ namespace BlobToSharePointMigrator.Services;
 internal static class CaseDocumentsPathRules
 {
     private static readonly Regex DocumentsFolderSegment = new(@"^(\d+)_Documents$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex YearSegment = new(@"^\d{4}$", RegexOptions.Compiled);
 
     internal static string[] SplitPathSegments(string? blobPath)
     {
@@ -51,5 +52,25 @@ internal static class CaseDocumentsPathRules
 
         var m = DocumentsFolderSegment.Match(segments[i]);
         return m.Success ? m.Groups[1].Value : null;
+    }
+
+    /// <summary>
+    /// Year from the closest standalone <c>YYYY</c> path segment before the aligned case-documents folder.
+    /// This intentionally ignores years embedded in container/prefix names such as <c>ActiveCases_Docs_Feb2026</c>.
+    /// </summary>
+    internal static string? TryGetAlignedYear(string? blobPath)
+    {
+        var segments = SplitPathSegments(blobPath);
+        var documentsIndex = FindAlignedDocumentsSegmentIndex(segments);
+        if (documentsIndex < 0)
+            return null;
+
+        for (var i = documentsIndex - 1; i >= 0; i--)
+        {
+            if (YearSegment.IsMatch(segments[i]))
+                return segments[i];
+        }
+
+        return null;
     }
 }
