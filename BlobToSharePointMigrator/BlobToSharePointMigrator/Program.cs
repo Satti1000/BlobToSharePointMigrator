@@ -85,6 +85,17 @@ static void ValidateStartupSettings(MigrationSettings migrationSettings)
     if (string.IsNullOrWhiteSpace(migrationSettings.SharePointCertificatePath) &&
         string.IsNullOrWhiteSpace(migrationSettings.SharePointCertificateThumbprint))
         errors.Add("Migration certificate is not configured. Set Migration:SharePointCertificatePath (+Password) or Migration:SharePointCertificateThumbprint.");
+    if ((migrationSettings.MigrationYearStart > 0 || migrationSettings.MigrationYearEnd > 0) &&
+        migrationSettings.MigrationYear <= 0 &&
+        (migrationSettings.MigrationYearStart <= 0 || migrationSettings.MigrationYearEnd <= 0))
+        errors.Add("Set both Migration:MigrationYearStart and Migration:MigrationYearEnd for a year range, or leave both as 0.");
+    if (migrationSettings.MigrationYearStart > 0 &&
+        migrationSettings.MigrationYearEnd > 0 &&
+        migrationSettings.MigrationYearStart > migrationSettings.MigrationYearEnd)
+        errors.Add("Migration:MigrationYearStart cannot be greater than Migration:MigrationYearEnd.");
+    if (migrationSettings.MigrationYear > 0 &&
+        (migrationSettings.MigrationYearStart > 0 || migrationSettings.MigrationYearEnd > 0))
+        errors.Add("Use either Migration:MigrationYear for a single year or Migration:MigrationYearStart/End for a range, not both.");
 
     if (errors.Count > 0)
         throw new InvalidOperationException("Startup settings validation failed:\n - " + string.Join("\n - ", errors));
@@ -105,8 +116,10 @@ static string StripLibraryPrefix(string mappedPath, string libraryPrefix)
 
 static string BuildSummaryYearLabel(MigrationSettings s, List<FileRecord> files)
 {
-    if (s.MigrationYear > 0)
-        return s.MigrationYear.ToString();
+    if (TryGetConfiguredYearScope(s, out var configuredStart, out var configuredEnd))
+        return configuredStart == configuredEnd
+            ? configuredStart.ToString()
+            : $"{configuredStart}-{configuredEnd}";
     if (files.Count == 0)
         return "—";
     var years = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -125,6 +138,38 @@ static string BuildSummaryYearLabel(MigrationSettings s, List<FileRecord> files)
     if (ordered.Count <= 5)
         return string.Join(", ", ordered);
     return string.Join(", ", ordered.Take(5)) + ", …";
+}
+
+static bool TryGetConfiguredYearScope(MigrationSettings s, out int startYear, out int endYear)
+{
+    if (s.MigrationYear > 0)
+    {
+        startYear = s.MigrationYear;
+        endYear = s.MigrationYear;
+        return true;
+    }
+
+    if (s.MigrationYearStart > 0 && s.MigrationYearEnd > 0)
+    {
+        startYear = s.MigrationYearStart;
+        endYear = s.MigrationYearEnd;
+        return true;
+    }
+
+    startYear = 0;
+    endYear = 0;
+    return false;
+}
+
+static bool TryGetMappedPathYear(FileRecord record, out int year)
+{
+    var path = (record.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
+    var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (segs.Length > 0 && int.TryParse(segs[0], out year) && year is >= 1000 and <= 9999)
+        return true;
+
+    year = 0;
+    return false;
 }
 
 static bool MigrationJobHasSaveConflictErrors(MigrationJobInfo info)
@@ -245,18 +290,19 @@ try
     }
 
     // Optional year filter on mapped destination (YYYY/CaseNumber/...)
-    if (migrationSettings.MigrationYear > 0 && migrationSettings.UseYyyyCaseNumberPath)
+    if (TryGetConfiguredYearScope(migrationSettings, out var filterStartYear, out var filterEndYear) &&
+        migrationSettings.UseYyyyCaseNumberPath)
     {
-        var yearStr = migrationSettings.MigrationYear.ToString();
         var before = toMigrate.Count;
-        toMigrate = toMigrate.Where(r =>
-        {
-            var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/');
-            var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            return segs.Length > 0 && string.Equals(segs[0], yearStr, StringComparison.OrdinalIgnoreCase);
-        }).ToList();
-        logger.LogInformation("Applied MigrationYear filter: kept {Kept} of {Before} files for year {Year}",
-            toMigrate.Count, before, migrationSettings.MigrationYear);
+        toMigrate = toMigrate
+            .Where(r => TryGetMappedPathYear(r, out var year) && year >= filterStartYear && year <= filterEndYear)
+            .ToList();
+
+        var scopeLabel = filterStartYear == filterEndYear
+            ? filterStartYear.ToString()
+            : $"{filterStartYear}-{filterEndYear}";
+        logger.LogInformation("Applied migration year scope filter: kept {Kept} of {Before} files for year scope {YearScope}",
+            toMigrate.Count, before, scopeLabel);
     }
     if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
     {
