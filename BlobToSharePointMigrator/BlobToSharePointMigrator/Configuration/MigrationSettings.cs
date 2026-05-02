@@ -47,6 +47,12 @@ public class MigrationSettings
     /// </summary>
     public bool TreatIncompleteSpmiBatchAsPartialSuccessForMetadata { get; set; } = false;
 
+    /// <summary>
+    /// When true, skips the SPMI upload job and only patches CaseId / CaseType / DocumentId
+    /// on files that already exist in SharePoint at the mapped destination paths.
+    /// </summary>
+    public bool MetadataOnlyMode { get; set; } = false;
+
     public Dictionary<string,string> MetadataFieldMap { get; set; } = new(); // blobMetaKey -> sharepointFieldInternalName
     public string BlobFolderPrefix          { get; set; } = string.Empty; // optional source filter
     public int MigrationYear                { get; set; } = 0;            // 0 = all years

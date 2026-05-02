@@ -152,6 +152,52 @@ static string ExtractCaseFolderFromMappedPath(string? mappedPath)
     return string.Empty;
 }
 
+async Task<int> PatchCaseMetadataForExistingFilesAsync(IReadOnlyList<FileRecord> recordsToPatch, string stepLabel)
+{
+    if (recordsToPatch.Count == 0)
+        return 0;
+
+    var metaService = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
+    await metaService.ConnectAsync();
+
+    var totalPatched = 0;
+    if (migrationSettings.YearAsLibrary)
+    {
+        foreach (var g in recordsToPatch.GroupBy(r =>
+        {
+            var segs = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries);
+            return segs.Length > 0 && Regex.IsMatch(segs[0], @"^\d{4}$") ? segs[0] : string.Empty;
+        }, StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrEmpty(g.Key))
+            {
+                logger.LogWarning("{Step} - Skipping {Count} metadata-only record(s) because no YYYY library prefix was found in the mapped path.",
+                    stepLabel, g.Count());
+                continue;
+            }
+
+            var patched = await metaService.PatchCaseMetadataBulkAsync(g.ToList(), g.Key, g.Key);
+            totalPatched += patched;
+            logger.LogInformation("{Step} - Library {Library}: patched {Count} existing list items.",
+                stepLabel, g.Key, patched);
+        }
+    }
+    else if (!string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
+    {
+        totalPatched = await metaService.PatchCaseMetadataBulkAsync(
+            recordsToPatch.ToList(), migrationSettings.SharePointDocumentLibrary, yearPrefixToStrip: null);
+        logger.LogInformation("{Step} - Library {Library}: patched {Count} existing list items.",
+            stepLabel, migrationSettings.SharePointDocumentLibrary, totalPatched);
+    }
+    else
+    {
+        logger.LogWarning("{Step} - No SharePoint library configured; metadata patch skipped.", stepLabel);
+    }
+
+    return totalPatched;
+}
+
 try
 {
     logger.LogInformation("Running startup configuration precheck...");
@@ -190,7 +236,13 @@ try
     foreach (var s in skipped)
         logger.LogInformation("Skipped: {File} ({Reason})", s.BlobPath, s.SkipReason);
 
-    var toMigrate = allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
+    var toMigrate = migrationSettings.MetadataOnlyMode
+        ? allowed.ToList()
+        : allowed.Where(r => !reportSvc.ShouldSkip(r)).ToList();
+    if (migrationSettings.MetadataOnlyMode && migrationSettings.DeltaMode)
+    {
+        logger.LogInformation("MetadataOnlyMode is enabled; DeltaMode skip is ignored so existing SharePoint files can be patched.");
+    }
 
     // Optional year filter on mapped destination (YYYY/CaseNumber/...)
     if (migrationSettings.MigrationYear > 0 && migrationSettings.UseYyyyCaseNumberPath)
@@ -248,9 +300,46 @@ try
 
     if (toMigrate.Count == 0)
     {
-        logger.LogInformation("No files to migrate (all already migrated or filtered)");
+        logger.LogInformation(migrationSettings.MetadataOnlyMode
+            ? "No files to patch (all records were filtered or invalid)."
+            : "No files to migrate (all already migrated or filtered)");
         reportSvc.SaveDeltaTracking();
         reportSvc.PrintSummary(new List<MigrationResult>(), skipped, 0, records.Count, toMigrate.Count, 0, 0,
+            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate));
+        Environment.Exit(0);
+    }
+
+    if (migrationSettings.MetadataOnlyMode)
+    {
+        logger.LogInformation("MetadataOnlyMode enabled: skipping SPMI upload/copy and patching metadata on existing SharePoint files by mapped path.");
+        var patched = await PatchCaseMetadataForExistingFilesAsync(toMigrate, "METADATA-ONLY");
+
+        var metadataOnlyResults = toMigrate.Select(record =>
+        {
+            var targetLibrary = migrationSettings.YearAsLibrary
+                ? ((record.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/')
+                    .Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty)
+                : migrationSettings.SharePointDocumentLibrary ?? string.Empty;
+            var destPath = StripLibraryPrefix(record.MappedPath ?? string.Empty, targetLibrary);
+            var documentIdPresent = record.Metadata.TryGetValue("DocumentId", out var did) && !string.IsNullOrWhiteSpace(did);
+
+            return new MigrationResult
+            {
+                SourceFile = record.BlobPath,
+                DestPath = destPath,
+                SizeBytes = record.SizeBytes,
+                LastModified = record.LastModified,
+                Status = "MetadataPatchAttempted",
+                SharePointUrl = $"{migrationSettings.SharePointSiteUrl.TrimEnd('/')}/{targetLibrary}/{destPath}",
+                Error = documentIdPresent ? string.Empty : "DocumentId missing after manifest matching; CaseId/CaseType patch may still have been attempted.",
+                Duration = "N/A (metadata-only)"
+            };
+        }).ToList();
+
+        reportSvc.WriteReport(metadataOnlyResults);
+        logger.LogInformation("Metadata-only complete: attempted {Attempted} files, patched {Patched} existing SharePoint list items. No files were uploaded or overwritten.",
+            toMigrate.Count, patched);
+        reportSvc.PrintSummary(metadataOnlyResults, skipped, 0, records.Count, toMigrate.Count, 0, 0,
             migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate));
         Environment.Exit(0);
     }
@@ -595,30 +684,7 @@ try
         }
         else
         {
-            var metaService = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
-            await metaService.ConnectAsync();
-
-            if (migrationSettings.YearAsLibrary)
-            {
-                foreach (var g in metaRecords.GroupBy(r =>
-                {
-                    var segs = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/')
-                        .Split('/', StringSplitOptions.RemoveEmptyEntries);
-                    return segs.Length > 0 && Regex.IsMatch(segs[0], @"^\d{4}$") ? segs[0] : string.Empty;
-                }, StringComparer.OrdinalIgnoreCase))
-                {
-                    if (string.IsNullOrEmpty(g.Key)) continue;
-                    var patched = await metaService.PatchCaseMetadataBulkAsync(g.ToList(), g.Key, g.Key);
-                    logger.LogInformation("STEP 5/5 - Library {Library}: patched {Count} list items.", g.Key, patched);
-                }
-            }
-            else if (!string.IsNullOrWhiteSpace(migrationSettings.SharePointDocumentLibrary))
-            {
-                var patched = await metaService.PatchCaseMetadataBulkAsync(
-                    metaRecords, migrationSettings.SharePointDocumentLibrary, yearPrefixToStrip: null);
-                logger.LogInformation("STEP 5/5 - Library {Library}: patched {Count} list items.",
-                    migrationSettings.SharePointDocumentLibrary, patched);
-            }
+            await PatchCaseMetadataForExistingFilesAsync(metaRecords, "STEP 5/5");
         }
     }
 
