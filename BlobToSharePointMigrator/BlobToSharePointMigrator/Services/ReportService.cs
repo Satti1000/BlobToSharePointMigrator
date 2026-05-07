@@ -125,6 +125,30 @@ public class ReportService
         var success  = results.Count(r => r.Status == "Success");
         var partial  = results.Count(r => r.Status == "PartialSuccess");
         var failed   = results.Count(r => r.Status == "Failed");
+        var migrated = success + partial;
+
+        static bool ContainsAny(string source, params string[] needles)
+        {
+            if (string.IsNullOrWhiteSpace(source))
+                return false;
+            foreach (var needle in needles)
+            {
+                if (source.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        var failedAlreadyExistsRows = results.Count(r =>
+            r.Status == "Failed" &&
+            ContainsAny(r.Error, "already exists", "same name already exists", "a file with the same name"));
+        var failedOverwriteRows = results.Count(r =>
+            r.Status == "Failed" &&
+            ContainsAny(r.Error, "save conflict", "conflict with those made concurrently", "overwrite"));
+        var overwriteSignalRows = reportExistingFilesAsOverwritten ? alreadyExistsConflicts : 0;
+        var sourceScope = string.IsNullOrWhiteSpace(_settings.BlobFolderPrefix)
+            ? "(container root / full configured scope)"
+            : _settings.BlobFolderPrefix.Replace('\\', '/').Trim('/');
 
         // Build summary block styled after Application 1.
         // Logged via _logger (appears in log files) AND Console.WriteLine (appears in terminal).
@@ -147,6 +171,21 @@ public class ReportService
         if (estimatedCaseFolders > 0)
             lines.AppendLine($"  Unique case folders in plan (YYYY/Case): {estimatedCaseFolders}");
         lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");
+        lines.AppendLine("======================================================");
+        lines.AppendLine("Comparison after migration:");
+        lines.AppendLine();
+        lines.AppendLine($"  Blob path where files come from:      {sourceScope}");
+        lines.AppendLine($"  Total files present on blob scope:    {Math.Max(0, blobsListed - skipped.Count)}");
+        lines.AppendLine($"  Total files migrated to SP:           {migrated}");
+        lines.AppendLine($"  Total files failed to migrate to SP:  {failed}");
+        lines.AppendLine();
+        lines.AppendLine($"  Total files already-exists on SP:     {alreadyExistsConflicts}");
+        lines.AppendLine($"  Total files overwrite-signaled on SP: {overwriteSignalRows}");
+        lines.AppendLine($"  Total files failed to overwrite:      {failedOverwriteRows + failedAlreadyExistsRows}");
+        lines.AppendLine();
+        lines.AppendLine($"  Failure details log:                  {_settings.ReportFile}");
+        lines.AppendLine($"  Retry input file:                     {_settings.FailedItemsFile}");
+        lines.AppendLine($"  Retry failed-only flag:               Migration:RetryFailedOnly=true");
         lines.AppendLine("======================================================");
         lines.AppendLine($"  Report saved:      {_settings.ReportFile}");
         lines.AppendLine($"  Overwrite audit:   {_settings.OverwriteAuditReportFile}");
