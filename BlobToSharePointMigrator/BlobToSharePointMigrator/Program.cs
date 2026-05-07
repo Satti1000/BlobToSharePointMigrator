@@ -396,8 +396,8 @@ try
     // STEP 4/5 and 5/5 — optionally partition into multiple jobs to improve SharePoint-side throughput.
     // Simple heuristic: when using YYYY/CaseNumber mapping and file count is large, batch by case folder,
     // with a soft cap per job.
-    const int MaxFilesPerJob = 2000;
-    var enablePartitioning = migrationSettings.UseYyyyCaseNumberPath && toMigrate.Count > MaxFilesPerJob;
+    var maxFilesPerJob = Math.Max(50, migrationSettings.MaxFilesPerJob);
+    var enablePartitioning = migrationSettings.UseYyyyCaseNumberPath && toMigrate.Count > maxFilesPerJob;
 
     List<List<BlobToSharePointMigrator.Models.FileRecord>> BuildBatches(List<BlobToSharePointMigrator.Models.FileRecord> files)
     {
@@ -421,13 +421,13 @@ try
             list.Add(r);
         }
 
-        // Pack case groups into jobs of ~MaxFilesPerJob
+        // Pack case groups into jobs of ~maxFilesPerJob
         var batches = new List<List<BlobToSharePointMigrator.Models.FileRecord>>();
         var current = new List<BlobToSharePointMigrator.Models.FileRecord>();
         foreach (var kvp in byCase)
         {
             var group = kvp.Value;
-            if (current.Count + group.Count > MaxFilesPerJob && current.Count > 0)
+            if (current.Count + group.Count > maxFilesPerJob && current.Count > 0)
             {
                 batches.Add(current);
                 current = new List<BlobToSharePointMigrator.Models.FileRecord>();
@@ -440,6 +440,7 @@ try
 
     var batchesToRun = BuildBatches(toMigrate);
     logger.LogInformation("Submitting {BatchCount} migration job(s) ({Total} files total)...", batchesToRun.Count, toMigrate.Count);
+    logger.LogInformation("Migration:MaxFilesPerJob = {MaxFilesPerJob}", maxFilesPerJob);
     logger.LogInformation(
         "Migration:EnableMigrationJobSaveConflictRetry = {Enabled}. When true, Save Conflict resubmit uses MigrationJobSaveConflictRetries={Retries}, delay {Delay}s.",
         migrationSettings.EnableMigrationJobSaveConflictRetry,
