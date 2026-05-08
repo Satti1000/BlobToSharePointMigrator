@@ -11,6 +11,8 @@ internal static class CaseDocumentsPathRules
 {
     private static readonly Regex DocumentsFolderSegment = new(@"^(\d+)_Documents$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex YearSegment = new(@"^\d{4}$", RegexOptions.Compiled);
+    /// <summary>Month folder under the Wilberforce layout: <c>M01</c>…<c>M12</c>.</summary>
+    private static readonly Regex MonthFolderSegment = new(@"^M\d{2}$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     internal static string[] SplitPathSegments(string? blobPath)
     {
@@ -55,8 +57,11 @@ internal static class CaseDocumentsPathRules
     }
 
     /// <summary>
-    /// Year from the closest standalone <c>YYYY</c> path segment before the aligned case-documents folder.
-    /// This intentionally ignores years embedded in container/prefix names such as <c>ActiveCases_Docs_Feb2026</c>.
+    /// Year folder segment before <c>{case}/{case}_Documents</c>.
+    /// Prefers <c>YYYY</c> immediately followed by <c>M01</c>…<c>M12</c> (Wilberforce inactive layout) so a stray
+    /// <c>/2026/</c> segment earlier in the path does not win over <c>/2014/M03/</c>.
+    /// Falls back to the first <c>YYYY</c> segment when scanning backward from <c>_Documents</c>.
+    /// Ignores years embedded only in container names (no standalone <c>YYYY</c> segment).
     /// </summary>
     internal static string? TryGetAlignedYear(string? blobPath)
     {
@@ -64,6 +69,13 @@ internal static class CaseDocumentsPathRules
         var documentsIndex = FindAlignedDocumentsSegmentIndex(segments);
         if (documentsIndex < 0)
             return null;
+
+        // Strong signal: .../2014/M03/.../82066701/82066701_Documents/...
+        for (var i = 1; i < documentsIndex; i++)
+        {
+            if (MonthFolderSegment.IsMatch(segments[i]) && YearSegment.IsMatch(segments[i - 1]))
+                return segments[i - 1];
+        }
 
         for (var i = documentsIndex - 1; i >= 0; i--)
         {

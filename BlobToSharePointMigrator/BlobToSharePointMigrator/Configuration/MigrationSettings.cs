@@ -49,6 +49,12 @@ public class MigrationSettings
     public bool TreatIncompleteSpmiBatchAsPartialSuccessForMetadata { get; set; } = false;
 
     /// <summary>
+    /// After patching files in STEP 5, set CaseId and CaseType on the first subfolder under each case
+    /// (e.g. email-named folder above <c>03/26.pdf</c>). DocumentId remains file-only. Disable to skip folder list-item updates.
+    /// </summary>
+    public bool PatchCaseTopFolderMetadataAfterFiles { get; set; } = true;
+
+    /// <summary>
     /// When true, skips the SPMI upload job and only patches CaseId / CaseType / DocumentId
     /// on files that already exist in SharePoint at the mapped destination paths.
     /// </summary>

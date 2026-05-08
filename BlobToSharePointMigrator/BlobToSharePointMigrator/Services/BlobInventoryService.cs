@@ -49,13 +49,18 @@ public class BlobInventoryService
                 if (!CaseDocumentsPathRules.IsUnderAlignedCaseNumberDocuments(blob.Name))
                     continue;
 
+                var fileName = Path.GetFileName(blob.Name);
+                var isFolderMarker = blob.Name.EndsWith("/", StringComparison.Ordinal) ||
+                                     string.IsNullOrWhiteSpace(fileName);
                 var ext = Path.GetExtension(blob.Name).ToLowerInvariant();
-                var allowed = true; // allowedExtensions.Contains(ext);
-                var skipReason = allowed ? string.Empty : $"Extension '{ext}' not in allowed list";
+                var allowed = !isFolderMarker; // allowedExtensions.Contains(ext);
+                var skipReason = isFolderMarker
+                    ? "Folder marker blob; metadata patch expects file path."
+                    : allowed ? string.Empty : $"Extension '{ext}' not in allowed list";
 
                 var record = new FileRecord
                 {
-                    Name = Path.GetFileName(blob.Name),
+                    Name = fileName,
                     BlobPath = blob.Name,
                     SizeBytes = blob.Properties.ContentLength ?? 0,
                     ContentType = blob.Properties.ContentType ?? "application/octet-stream",

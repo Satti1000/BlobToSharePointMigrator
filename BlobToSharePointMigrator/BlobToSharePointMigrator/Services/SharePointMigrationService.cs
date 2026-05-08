@@ -253,6 +253,7 @@ public class SharePointMigrationService
                 }
 
                 record.MappedPath = safePath;
+                record.SubmittedMappedPath = safePath;
                 validRecords.Add(record);
             }
             catch (Exception ex)
@@ -1495,6 +1496,33 @@ public class SharePointMigrationService
     // ── Bulk CSOM metadata patch ──────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Library-relative path to the first folder under the case when files live deeper
+    /// (<c>case/email/03/26.pdf</c> → <c>case/email</c>, or with year prefix <c>year/case/email</c>).
+    /// </summary>
+    internal static bool TryGetTopCaseSubfolderRelativePath(string metadataRelativePath, string? yearPrefixToStrip, out string folderRelativePath)
+    {
+        folderRelativePath = string.Empty;
+        var normalized = (metadataRelativePath ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (string.IsNullOrEmpty(normalized))
+            return false;
+
+        var segs = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        if (!string.IsNullOrEmpty(yearPrefixToStrip))
+        {
+            if (segs.Length < 3)
+                return false;
+            folderRelativePath = string.Join("/", segs[..2]);
+            return true;
+        }
+
+        if (segs.Length < 4)
+            return false;
+        folderRelativePath = string.Join("/", segs[..3]);
+        return true;
+    }
+
+    /// <summary>
     /// After SPMI jobs complete, patches CaseId, CaseType, and DocumentId (when present on records)
     /// on SharePoint list items. Uses <c>GetFileByServerRelativeUrl</c> for each <see cref="FileRecord.MappedPath"/>
     /// (batched) so the library is not enumerated with CAML — that avoids the list view threshold on large
@@ -1558,13 +1586,7 @@ public class SharePointMigrationService
                         r.Metadata.ContainsKey("DocumentId"))
             .GroupBy(r =>
             {
-                var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').TrimStart('/');
-                if (!string.IsNullOrEmpty(yearPrefixToStrip))
-                {
-                    var prefix = yearPrefixToStrip.TrimEnd('/') + "/";
-                    if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                        path = path[prefix.Length..];
-                }
+                var path = MetadataPatchRelativePath(r, yearPrefixToStrip);
                 var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
                 // Return the directory containing the file (all segments except the last).
                 return segs.Length >= 2 ? string.Join("/", segs[..^1]) : string.Empty;
@@ -1590,7 +1612,10 @@ public class SharePointMigrationService
             {
                 if (!rec.Metadata.TryGetValue("DocumentId", out var did) || string.IsNullOrWhiteSpace(did))
                     continue;
-                var destName = Path.GetFileName((rec.MappedPath ?? string.Empty).Replace('\\', '/').TrimEnd('/'));
+                var canon = MetadataPatchRelativePath(rec, yearPrefixToStrip);
+                var destName = string.IsNullOrEmpty(canon)
+                    ? rec.Name
+                    : Path.GetFileName(canon.TrimEnd('/'));
                 if (string.IsNullOrWhiteSpace(destName))
                     destName = rec.Name;
                 destName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(destName);
@@ -1625,6 +1650,26 @@ public class SharePointMigrationService
                         caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
                     .ConfigureAwait(false);
                 totalPatched += patched;
+
+                if (_settings.PatchCaseTopFolderMetadataAfterFiles &&
+                    (!string.IsNullOrWhiteSpace(caseId) || !string.IsNullOrWhiteSpace(caseType)))
+                {
+                    var folderUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var rec in caseGroup)
+                    {
+                        var rel = MetadataPatchRelativePath(rec, yearPrefixToStrip);
+                        if (TryGetTopCaseSubfolderRelativePath(rel, yearPrefixToStrip, out var folderRel))
+                            folderUrls.Add($"{rootFolderUrl.TrimEnd('/')}/{folderRel}");
+                    }
+
+                    foreach (var folderUrl in folderUrls)
+                    {
+                        var n = await PatchCaseFolderCaseMetadataAsync(
+                                folderUrl, caseIdField, caseId, caseTypeField, caseType)
+                            .ConfigureAwait(false);
+                        totalPatched += n;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1639,22 +1684,20 @@ public class SharePointMigrationService
         return totalPatched;
     }
 
-    private static string? BuildServerRelativeFileUrlForCaseMetadataPatch(
-        string listRootUrl,
-        string? yearPrefixToStrip,
-        FileRecord record)
+    /// <summary>
+    /// Library-relative path used for metadata patch — must match SPMI submit (sanitized), not pre-submit <see cref="FileRecord.MappedPath"/> when they differ.
+    /// </summary>
+    internal static string MetadataPatchRelativePath(FileRecord record, string? yearPrefixToStrip)
     {
-        var rel = (record.MappedPath ?? string.Empty).Replace('\\', '/').Trim();
+        var rel = (!string.IsNullOrWhiteSpace(record.SubmittedMappedPath)
+                ? record.SubmittedMappedPath
+                : record.MappedPath ?? string.Empty)
+            .Replace('\\', '/')
+            .Trim();
         if (string.IsNullOrEmpty(rel) || rel == "/")
-        {
-            if (string.IsNullOrWhiteSpace(record.Name))
-                return null;
             rel = record.Name;
-        }
         else
-        {
             rel = rel.TrimStart('/');
-        }
 
         if (!string.IsNullOrEmpty(yearPrefixToStrip))
         {
@@ -1663,9 +1706,21 @@ public class SharePointMigrationService
                 rel = rel[p.Length..];
         }
 
-        rel = rel.Replace("//", "/").Trim().TrimStart('/');
+        return rel.Replace("//", "/").Trim().TrimStart('/');
+    }
+
+    private static string? BuildServerRelativeFileUrlForCaseMetadataPatch(
+        string listRootUrl,
+        string? yearPrefixToStrip,
+        FileRecord record)
+    {
+        var rel = MetadataPatchRelativePath(record, yearPrefixToStrip);
         if (string.IsNullOrEmpty(rel))
-            return null;
+        {
+            if (string.IsNullOrWhiteSpace(record.Name))
+                return null;
+            rel = record.Name.TrimStart('/');
+        }
 
         return $"{listRootUrl.TrimEnd('/')}/{rel}";
     }
@@ -1717,6 +1772,49 @@ public class SharePointMigrationService
         }
 
         return patched;
+    }
+
+    /// <summary>
+    /// Sets CaseId / CaseType on a folder list item (no DocumentId). Used after file patches per ISSUE 2.
+    /// </summary>
+    private async Task<int> PatchCaseFolderCaseMetadataAsync(
+        string folderServerRelativeUrl,
+        string? caseIdField, string? caseId,
+        string? caseTypeField, string? caseType)
+    {
+        if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType))
+            return 0;
+
+        try
+        {
+            var folder = _web.GetFolderByServerRelativeUrl(folderServerRelativeUrl);
+            _clientContextG.Load(folder, f => f.Exists, f => f.Name);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            if (!folder.Exists)
+            {
+                _logger.LogDebug("Folder not found at server-relative path; metadata patch skipped: {Url}.", folderServerRelativeUrl);
+                return 0;
+            }
+
+            _clientContextG.Load(folder, f => f.ListItemAllFields);
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            var item = folder.ListItemAllFields;
+            if (item is null)
+                return 0;
+
+            if (!string.IsNullOrWhiteSpace(caseIdField) && !string.IsNullOrWhiteSpace(caseId))
+                item[caseIdField] = caseId;
+            if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
+                item[caseTypeField] = caseType;
+            item.SystemUpdate();
+            await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Folder metadata patch failed for '{Url}'.", folderServerRelativeUrl);
+            return 0;
+        }
     }
 
     private static bool IsListViewThresholdException(Exception ex)

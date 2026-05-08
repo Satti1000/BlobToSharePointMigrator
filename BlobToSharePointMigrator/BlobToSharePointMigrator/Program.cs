@@ -65,6 +65,8 @@ var blobFolderPrefixLogValue = string.IsNullOrWhiteSpace(migrationSettings.BlobF
     ? "(empty — no BlobFolderPrefix filter; full container inventory per other settings)"
     : migrationSettings.BlobFolderPrefix.Replace('\\', '/').TrimEnd('/');
 logger.LogInformation("Migration:BlobFolderPrefix = {BlobFolderPrefix}", blobFolderPrefixLogValue);
+if (migrationSettings.MaxParallelJobs > 1)
+    logger.LogInformation("Migration:MaxParallelJobs={Count} — overlapping jobs against the same library can trigger Save Conflict (JobError); use 1 while debugging collisions.", migrationSettings.MaxParallelJobs);
 
 static void ValidateStartupSettings(MigrationSettings migrationSettings)
 {
@@ -113,6 +115,30 @@ static string StripLibraryPrefix(string mappedPath, string libraryPrefix)
         ? normalized[prefix.Length..]
         : normalized;
 }
+
+/// <summary>
+/// SPMI submit mutates only the submitted list (YearAsLibrary uses clones). Copy submit-time canonical paths so originals used in STEP 5 and reporting align with SharePoint.
+/// </summary>
+static void PropagateSubmittedCanonicalPaths(IEnumerable<FileRecord> originals, IEnumerable<FileRecord> submittedJobRecords)
+{
+    var map = new Dictionary<string, FileRecord>(StringComparer.OrdinalIgnoreCase);
+    foreach (var r in submittedJobRecords)
+    {
+        if (!string.IsNullOrWhiteSpace(r.BlobPath))
+            map[r.BlobPath] = r;
+    }
+
+    foreach (var orig in originals)
+    {
+        if (string.IsNullOrWhiteSpace(orig.BlobPath) || !map.TryGetValue(orig.BlobPath, out var job))
+            continue;
+        if (!string.IsNullOrWhiteSpace(job.SubmittedMappedPath))
+            orig.SubmittedMappedPath = job.SubmittedMappedPath;
+    }
+}
+
+static bool IsMetadataPatchEligibleFileRecord(FileRecord record, HashSet<string> successBlobPaths) =>
+    successBlobPaths.Contains(record.BlobPath) || !string.IsNullOrWhiteSpace(record.SubmittedMappedPath);
 
 static string BuildSummaryYearLabel(MigrationSettings s, List<FileRecord> files)
 {
@@ -524,6 +550,9 @@ try
                                 MappedPath = r.MappedPath.Replace('\\', '/').StartsWith(prefixToTrim, StringComparison.OrdinalIgnoreCase)
                                     ? r.MappedPath.Replace('\\', '/')[prefixToTrim.Length..]
                                     : r.MappedPath.Replace('\\', '/'),
+                                SubmittedMappedPath = r.SubmittedMappedPath.Replace('\\', '/').StartsWith(prefixToTrim, StringComparison.OrdinalIgnoreCase)
+                                    ? r.SubmittedMappedPath.Replace('\\', '/')[prefixToTrim.Length..]
+                                    : r.SubmittedMappedPath.Replace('\\', '/'),
                                 SizeBytes = r.SizeBytes,
                                 ContentType = r.ContentType,
                                 LastModified = r.LastModified,
@@ -548,6 +577,7 @@ try
                     for (var attempt = 0; ; attempt++)
                     {
                         var jobInfo = await batchSpService.SubmitMigrationJobAsync(batchForSubmit, blobService.DownloadBlobAsync, targetLibrary);
+                        PropagateSubmittedCanonicalPaths(batch, batchForSubmit);
                         logger.LogInformation("Migration job submitted: {JobId} (submit attempt {Attempt})", jobInfo.JobId, attempt + 1);
 
                         finalJobInfo = await batchSpService.PollMigrationJobAsync(
@@ -718,16 +748,16 @@ try
     }
 
     // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId) ───────────────────────
+    var successBlobPaths = new HashSet<string>(allResults
+        .Where(r => r.Status is "Success" or "PartialSuccess")
+        .Select(r => r.SourceFile), StringComparer.OrdinalIgnoreCase);
     logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId)...");
     {
-        var successBlobPaths = new HashSet<string>(allResults
-            .Where(r => r.Status is "Success" or "PartialSuccess")
-            .Select(r => r.SourceFile), StringComparer.OrdinalIgnoreCase);
-        var metaRecords = toMigrate.Where(r => successBlobPaths.Contains(r.BlobPath)).ToList();
+        var metaRecords = toMigrate.Where(r => IsMetadataPatchEligibleFileRecord(r, successBlobPaths)).ToList();
 
         if (metaRecords.Count == 0)
         {
-            logger.LogInformation("STEP 5/5 - No successful uploads to patch.");
+            logger.LogInformation("STEP 5/5 - No files eligible for metadata patch (no Success/PartialSuccess rows and no submit-time paths).");
         }
         else
         {
@@ -746,7 +776,7 @@ try
             var caseFolder = ExtractCaseFolderFromMappedPath(record.MappedPath);
             var year = caseFolder.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
             var documentIdPresent = record.Metadata.TryGetValue("DocumentId", out var did) && !string.IsNullOrWhiteSpace(did);
-            var metadataPatchEligible = result?.Status is "Success" or "PartialSuccess";
+            var metadataPatchEligible = IsMetadataPatchEligibleFileRecord(record, successBlobPaths);
             var note = audit.Note;
             if (!documentIdPresent)
                 note = string.IsNullOrWhiteSpace(note) ? "DocumentId missing after manifest matching." : $"{note} DocumentId missing after manifest matching.";

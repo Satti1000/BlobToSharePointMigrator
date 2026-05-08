@@ -113,6 +113,7 @@ public class PathTransformService
 
             seen.Add(mapped);
             record.MappedPath = mapped;
+            record.SubmittedMappedPath = mapped;
         }
         return records;
     }
