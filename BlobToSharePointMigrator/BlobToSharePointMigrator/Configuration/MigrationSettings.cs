@@ -34,6 +34,7 @@ public class MigrationSettings
     public bool UseYyyyCaseNumberPath       { get; set; } = true;
     public bool YearAsLibrary               { get; set; } = true; // when true, target library title is the year (YYYY)
     public int MaxParallelJobs              { get; set; } = 3;
+    public int MaxFilesPerJob               { get; set; } = 500;
     public bool EnableMigrationJobSaveConflictRetry { get; set; } = false;
     public int MigrationJobSaveConflictRetries { get; set; } = 1;
     public int MigrationJobSaveConflictRetryDelaySeconds { get; set; } = 45;
