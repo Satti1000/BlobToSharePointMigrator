@@ -58,8 +58,6 @@ var transformSvc = new PathTransformService(
     migrationSettings.SharePointTargetFolder);
 var spServiceProbe = new SharePointMigrationService(settings, migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
-// CaseDocumentMetadataService is instantiated here for future use in the metadata branch.
-// It is not called in this branch — EnrichAsync and bulk CSOM patch are both disabled below.
 var caseMetadataSvc = new CaseDocumentMetadataService(loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 
 var logger = loggerFactory.CreateLogger("Pipeline");
@@ -172,11 +170,9 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    // STEP 2.5 — XML metadata enrichment (CaseId/CaseType/DocumentId) is intentionally
-    // disabled in this branch. Priority is reliable file transfer first; metadata will be
-    // re-enabled in the next branch once file copy is confirmed working.
+    // STEP 2.5 — XML/path metadata enrichment (CaseId / CaseType / DocumentId / Wilerforce File Name / Wilerforce Date when manifest matches).
     await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
-    logger.LogInformation("STEP 2.5/5 - Metadata enrichment skipped (deferred to metadata branch).");
+    logger.LogInformation("STEP 2.5/5 - Case metadata enrichment finished (CaseId / CaseType / DocumentId / Wilerforce fields from paths and manifest when enabled).");
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -447,11 +443,51 @@ try
         await Task.WhenAll(tasks);
     }
 
-    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType) ──────────────────────────────────
-    // Disabled in this branch — priority is reliable file transfer first.
-    // PatchCaseMetadataBulkAsync is implemented in SharePointMigrationService and ready to use;
-    // it will be re-enabled in the next branch once file copy success is confirmed.
-    logger.LogInformation("STEP 5/5 - Metadata patch deferred (will be enabled in metadata branch).");
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId, CaseType, DocumentId, Wilerforce Date, Wilerforce File Name) ──
+    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch...");
+    {
+        var successBlobPaths = new HashSet<string>(
+            allResults.Where(r => r.Status is "Success" or "PartialSuccess").Select(r => r.SourceFile),
+            StringComparer.OrdinalIgnoreCase);
+        var metaRecords = toMigrate.Where(r => successBlobPaths.Contains(r.BlobPath)).ToList();
+
+        if (metaRecords.Count == 0)
+        {
+            logger.LogInformation("STEP 5/5 - No successful uploads to patch.");
+        }
+        else
+        {
+            var metaSpService = new SharePointMigrationService(settings, migrationSettings,
+                loggerFactory.CreateLogger<SharePointMigrationService>());
+            await metaSpService.ConnectAsync();
+
+            if (migrationSettings.YearAsLibrary)
+            {
+                foreach (var g in metaRecords.GroupBy(r =>
+                {
+                    var segs = (r.MappedPath ?? string.Empty).Replace('\\', '/').Trim('/')
+                        .Split('/', StringSplitOptions.RemoveEmptyEntries);
+                    return segs.Length > 0 ? segs[0] : string.Empty;
+                }, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrEmpty(g.Key))
+                    {
+                        logger.LogWarning("STEP 5/5 - Skipping {Count} record(s): no year segment in MappedPath.", g.Count());
+                        continue;
+                    }
+
+                    var patched = await metaSpService.PatchCaseMetadataBulkAsync(g.ToList(), g.Key, g.Key);
+                    logger.LogInformation("STEP 5/5 - Library '{Library}': patched {Count} list items.", g.Key, patched);
+                }
+            }
+            else
+            {
+                var lib = migrationSettings.SharePointDocumentLibrary ?? "Documents";
+                var patched = await metaSpService.PatchCaseMetadataBulkAsync(metaRecords, lib, yearPrefixToStrip: null);
+                logger.LogInformation("STEP 5/5 - Library '{Library}': patched {Count} list items.", lib, patched);
+            }
+        }
+    }
 
     reportSvc.SaveDeltaTracking();
     reportSvc.WriteReport(allResults);

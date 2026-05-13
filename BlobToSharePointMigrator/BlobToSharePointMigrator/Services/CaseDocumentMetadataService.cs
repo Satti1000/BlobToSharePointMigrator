@@ -71,6 +71,13 @@ public class CaseDocumentMetadataService
                 }
             }
 
+            foreach (var record in recordsInCase)
+            {
+                if (IsCaseManifestFile(record.Name))
+                    continue;
+                EnsureMetadataDictionary(record)["WilerforceFileName"] = record.Name;
+            }
+
             if (!xmlLookupByCaseFolder.TryGetValue(caseFolderKey, out var manifestBlobPath) ||
                 string.IsNullOrWhiteSpace(manifestBlobPath))
             {
@@ -100,10 +107,12 @@ public class CaseDocumentMetadataService
                 if (IsCaseManifestFile(record.Name))
                     continue;
 
-                if (manifest.TryAssignDocumentId(record.Name, record.ContentType, out var documentId, out var matchMode))
+                if (manifest.TryAssignDocumentId(record.Name, record.ContentType, out var documentId, out var manifestDocumentDate, out var matchMode))
                 {
                     EnsureMetadataDictionary(record)["DocumentId"] = documentId;
                     documentIdAssigned++;
+                    if (!string.IsNullOrWhiteSpace(manifestDocumentDate))
+                        EnsureMetadataDictionary(record)["WilerforceDate"] = manifestDocumentDate;
                     _logger.LogDebug("Assigned DocumentId via {MatchMode} match: {BlobPath} -> {DocumentId}",
                         matchMode, record.BlobPath, documentId);
                 }
@@ -301,6 +310,7 @@ public class CaseDocumentMetadataService
                     type: element.Attribute("Type")?.Value?.Trim() ?? string.Empty,
                     category: element.Attribute("Category")?.Value?.Trim() ?? string.Empty,
                     source: element.Attribute("Source")?.Value?.Trim() ?? string.Empty,
+                    documentDate: ReadDocumentDateFromXml(element),
                     sequence: index))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Name))
                 .ToList()
@@ -357,15 +367,28 @@ public class CaseDocumentMetadataService
             return new CaseManifestIndex(exact, normalized, typed, stems, folderDocuments);
         }
 
-        public bool TryAssignDocumentId(string fileName, string? contentType, out string documentId, out string matchMode)
+        private static string ReadDocumentDateFromXml(XElement element)
+        {
+            var fromAttr = element.Attribute("DocumentDate")?.Value?.Trim()
+                ?? element.Attribute("Document_Date")?.Value?.Trim()
+                ?? element.Attribute("Date")?.Value?.Trim();
+            if (!string.IsNullOrWhiteSpace(fromAttr))
+                return fromAttr;
+            var child = element.Element("DocumentDate") ?? element.Element("Document_Date") ?? element.Element("Date");
+            return child?.Value?.Trim() ?? string.Empty;
+        }
+
+        public bool TryAssignDocumentId(string fileName, string? contentType, out string documentId, out string? manifestDocumentDate, out string matchMode)
         {
             documentId = string.Empty;
+            manifestDocumentDate = null;
             matchMode = string.Empty;
 
             if (TryTakeUnassigned(_exactNameLookup, fileName, out var exact))
             {
                 exact.Assigned = true;
                 documentId = exact.Id;
+                manifestDocumentDate = NullIfEmpty(exact.DocumentDate);
                 matchMode = "exact";
                 return true;
             }
@@ -375,6 +398,7 @@ public class CaseDocumentMetadataService
             {
                 normalized.Assigned = true;
                 documentId = normalized.Id;
+                manifestDocumentDate = NullIfEmpty(normalized.DocumentDate);
                 matchMode = "normalized";
                 return true;
             }
@@ -383,6 +407,7 @@ public class CaseDocumentMetadataService
             {
                 typed.Assigned = true;
                 documentId = typed.Id;
+                manifestDocumentDate = NullIfEmpty(typed.DocumentDate);
                 matchMode = "name+type";
                 return true;
             }
@@ -393,12 +418,15 @@ public class CaseDocumentMetadataService
             {
                 stem.Assigned = true;
                 documentId = stem.Id;
+                manifestDocumentDate = NullIfEmpty(stem.DocumentDate);
                 matchMode = "extensionless";
                 return true;
             }
 
             return false;
         }
+
+        private static string? NullIfEmpty(string s) => string.IsNullOrWhiteSpace(s) ? null : s;
 
         public IEnumerable<ManifestFolderDocument> FindFolderDocumentIds(string? mappedPath)
         {
@@ -439,13 +467,14 @@ public class CaseDocumentMetadataService
 
     private sealed class ManifestDocument
     {
-        public ManifestDocument(string id, string name, string type, string category, string source, int sequence)
+        public ManifestDocument(string id, string name, string type, string category, string source, string documentDate, int sequence)
         {
             Id = id;
             Name = name;
             Type = type;
             Category = category;
             Source = source;
+            DocumentDate = documentDate ?? string.Empty;
             Sequence = sequence;
             NormalizedName = NormalizeFileNameForMatch(name);
             NormalizedStem = NormalizeFileStemForMatch(name);
@@ -457,6 +486,8 @@ public class CaseDocumentMetadataService
         public string Type { get; }
         public string Category { get; }
         public string Source { get; }
+        /// <summary>Document date from manifest (attribute or child element); maps to SharePoint Wilerforce Date.</summary>
+        public string DocumentDate { get; }
         public int Sequence { get; }
         public string NormalizedName { get; }
         public string NormalizedStem { get; }
@@ -486,6 +517,10 @@ public class CaseDocumentMetadataService
         normalized = CollapseWhitespaceRegex.Replace(normalized, " ").Trim().TrimEnd('.');
         return normalized.ToLowerInvariant();
     }
+
+    /// <summary>Match SharePoint <c>FileLeafRef</c> to blob <see cref="FileRecord.Name"/> / mapped leaf names.</summary>
+    internal static string NormalizeFileNameForMetadataMatch(string? fileName) =>
+        NormalizeFileNameForMatch(fileName ?? string.Empty);
 
     private static string NormalizeFileStemForMatch(string fileName)
     {
