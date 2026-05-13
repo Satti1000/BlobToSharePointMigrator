@@ -57,7 +57,6 @@ var transformSvc = new PathTransformService(
 var spServiceProbe = new SharePointMigrationService(migrationSettings, loggerFactory.CreateLogger<SharePointMigrationService>());
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 var caseMetadataSvc = new CaseDocumentMetadataService(migrationSettings, loggerFactory.CreateLogger<CaseDocumentMetadataService>());
-
 var logger = loggerFactory.CreateLogger("Pipeline");
 
 // Client visibility: always emit BlobFolderPrefix at start of the log (empty = no prefix filter on inventory).
@@ -347,8 +346,9 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    logger.LogInformation("STEP 2.5/5 - Enriching CaseId, CaseType, and DocumentId (paths; DocumentId from case_NNN_documents.xml when AssignDocumentIdFromCaseXml is true)...");
+    logger.LogInformation("STEP 2.5/5 - Enriching CaseId, CaseType, DocumentId, and Wilerforce fields (paths; manifest when AssignDocumentIdFromCaseXml is true)...");
     await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
+    logger.LogInformation("STEP 2.5/5 - Case metadata enrichment finished.");
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -747,11 +747,11 @@ try
         await Task.WhenAll(tasks);
     }
 
-    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId) ───────────────────────
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilerforce Date / Wilerforce File Name) ───────────────────────
     var successBlobPaths = new HashSet<string>(allResults
         .Where(r => r.Status is "Success" or "PartialSuccess")
         .Select(r => r.SourceFile), StringComparer.OrdinalIgnoreCase);
-    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId)...");
+    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilerforce fields)...");
     {
         var metaRecords = toMigrate.Where(r => IsMetadataPatchEligibleFileRecord(r, successBlobPaths)).ToList();
 

@@ -1340,10 +1340,8 @@ public class SharePointMigrationService
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            // Create/resolve columns for configured Migration display names even when no file had that
-            // metadata key this run (e.g. DocumentId not in XML — otherwise "Document ID" column was never ensured).
             var keysToResolve = new HashSet<string>(requiredKeys, StringComparer.OrdinalIgnoreCase);
-            foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId" })
+            foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId", "WilerforceDate", "WilerforceFileName" })
             {
                 if (!string.IsNullOrWhiteSpace(GetMetadataDisplayName(candidate)))
                     keysToResolve.Add(candidate);
@@ -1380,13 +1378,7 @@ public class SharePointMigrationService
 
                 if (!libraryCache.TryGetValue(metadataKey, out var internalName))
                 {
-                    if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
-                    {
-                        await EnsureCaseMetadataTextFieldAsync(libraryTitle, displayName).ConfigureAwait(false);
-                    }
-
+                    await EnsureSharePointMetadataColumnAsync(libraryTitle, metadataKey, displayName).ConfigureAwait(false);
                     internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
                     libraryCache[metadataKey] = internalName;
                 }
@@ -1421,28 +1413,13 @@ public class SharePointMigrationService
         }
     }
 
-    private string? GetMetadataDisplayName(string metadataKey)
+    private async Task EnsureSharePointMetadataColumnAsync(string libraryTitle, string metadataKey, string displayName)
     {
-        if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase))
-            return string.IsNullOrWhiteSpace(_settings.SharePointCaseIdColumnDisplayName)
-                ? null
-                : _settings.SharePointCaseIdColumnDisplayName;
-        if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
-            return string.IsNullOrWhiteSpace(_settings.SharePointCaseTypeColumnDisplayName)
-                ? null
-                : _settings.SharePointCaseTypeColumnDisplayName;
-        if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
-            return string.IsNullOrWhiteSpace(_settings.SharePointDocumentIdColumnDisplayName)
-                ? null
-                : _settings.SharePointDocumentIdColumnDisplayName;
-
-        return null;
+        _ = metadataKey;
+        await EnsureCaseMetadataTextFieldAsync(libraryTitle, displayName).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Creates a single-line text column on the document library if it does not already exist
-    /// (CaseId / CaseType / DocumentId). Does not throw; logs on failure.
-    /// </summary>
+    /// <summary>Creates a single-line text column if missing (CaseId, CaseType, DocumentId, Wilerforce fields).</summary>
     private async Task EnsureCaseMetadataTextFieldAsync(string libraryTitle, string displayName)
     {
         if (string.IsNullOrWhiteSpace(displayName))
@@ -1467,6 +1444,32 @@ public class SharePointMigrationService
                 "Could not create text column '{DisplayName}' on library '{Library}'. Create the column manually or check permissions.",
                 displayName, libraryTitle);
         }
+    }
+
+    private string? GetMetadataDisplayName(string metadataKey)
+    {
+        if (string.Equals(metadataKey, "CaseId", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointCaseIdColumnDisplayName)
+                ? null
+                : _settings.SharePointCaseIdColumnDisplayName;
+        if (string.Equals(metadataKey, "CaseType", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointCaseTypeColumnDisplayName)
+                ? null
+                : _settings.SharePointCaseTypeColumnDisplayName;
+        if (string.Equals(metadataKey, "DocumentId", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointDocumentIdColumnDisplayName)
+                ? "Document ID"
+                : _settings.SharePointDocumentIdColumnDisplayName;
+        if (string.Equals(metadataKey, "WilerforceDate", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointWilerforceDateColumnDisplayName)
+                ? "Wilerforce Date"
+                : _settings.SharePointWilerforceDateColumnDisplayName;
+        if (string.Equals(metadataKey, "WilerforceFileName", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointWilerforceFileNameColumnDisplayName)
+                ? "Wilerforce File Name"
+                : _settings.SharePointWilerforceFileNameColumnDisplayName;
+
+        return null;
     }
 
     private async Task<string?> ResolveFieldInternalNameAsync(string libraryTitle, string displayName)
@@ -1495,40 +1498,69 @@ public class SharePointMigrationService
 
     // ── Bulk CSOM metadata patch ──────────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Library-relative path to the first folder under the case when files live deeper
-    /// (<c>case/email/03/26.pdf</c> → <c>case/email</c>, or with year prefix <c>year/case/email</c>).
-    /// </summary>
-    internal static bool TryGetTopCaseSubfolderRelativePath(string metadataRelativePath, string? yearPrefixToStrip, out string folderRelativePath)
+    private static string GetLibraryRelativeFilePath(FileRecord r, string? yearPrefixToStrip)
     {
-        folderRelativePath = string.Empty;
-        var normalized = (metadataRelativePath ?? string.Empty).Replace('\\', '/').Trim('/');
-        if (string.IsNullOrEmpty(normalized))
-            return false;
-
-        var segs = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
+        var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').TrimStart('/');
         if (!string.IsNullOrEmpty(yearPrefixToStrip))
         {
-            if (segs.Length < 3)
-                return false;
-            folderRelativePath = string.Join("/", segs[..2]);
-            return true;
+            var prefix = yearPrefixToStrip.TrimEnd('/') + "/";
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                path = path[prefix.Length..];
         }
+        return path.Trim('/');
+    }
 
-        if (segs.Length < 4)
-            return false;
-        folderRelativePath = string.Join("/", segs[..3]);
-        return true;
+    private static Dictionary<string, FileRecord> BuildRecordsByNormFileName(IEnumerable<FileRecord> caseGroup, string? yearPrefixToStrip)
+    {
+        var dict = new Dictionary<string, FileRecord>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in caseGroup)
+        {
+            var path = GetLibraryRelativeFilePath(r, yearPrefixToStrip);
+            var leaf = Path.GetFileName(path.TrimEnd('/'));
+            if (string.IsNullOrWhiteSpace(leaf))
+                continue;
+            var key = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(leaf);
+            if (string.IsNullOrWhiteSpace(key))
+                continue;
+            dict[key] = r;
+        }
+        return dict;
+    }
+
+    private static Dictionary<string, string> BuildDocumentIdByNormFileName(IEnumerable<FileRecord> caseGroup, string? yearPrefixToStrip)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in caseGroup)
+        {
+            if (!r.Metadata.TryGetValue("DocumentId", out var did) || string.IsNullOrWhiteSpace(did))
+                continue;
+            var path = GetLibraryRelativeFilePath(r, yearPrefixToStrip);
+            var leaf = Path.GetFileName(path.TrimEnd('/'));
+            var key = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(leaf);
+            if (string.IsNullOrWhiteSpace(key))
+                continue;
+            dict[key] = did.Trim();
+        }
+        return dict;
+    }
+
+    private static string? GetListItemFileLeafRef(ListItem item)
+    {
+        var v = item["FileLeafRef"];
+        return v switch
+        {
+            FieldLookupValue lookup => lookup.LookupValue,
+            null => null,
+            _ => v.ToString()
+        };
     }
 
     /// <summary>
-    /// After SPMI jobs complete, patches CaseId, CaseType, and DocumentId (when present on records)
-    /// on SharePoint list items. Uses <c>GetFileByServerRelativeUrl</c> for each <see cref="FileRecord.MappedPath"/>
-    /// (batched) so the library is not enumerated with CAML — that avoids the list view threshold on large
-    /// document libraries. Only files present in the migration <paramref name="records"/> batch are updated.
+    /// After SPMI jobs complete, patches list item fields: CaseId, CaseType, DocumentId (when matched),
+    /// Wilerforce Date / Wilerforce File Name from enriched <see cref="FileRecord.Metadata"/> (per file via <c>FileLeafRef</c>).
+    /// Uses folder-scoped CAML in batches of 100.
     /// </summary>
-    /// <param name="records">Records whose Metadata contains CaseId/CaseType/DocumentId values.</param>
+    /// <param name="records">Records with <see cref="FileRecord.MappedPath"/> and metadata to apply.</param>
     /// <param name="libraryTitle">SharePoint document library title (e.g. "2010").</param>
     /// <param name="yearPrefixToStrip">
     /// When YearAsLibrary is true, pass the year string (e.g. "2010") so it is stripped from
@@ -1541,16 +1573,19 @@ public class SharePointMigrationService
     {
         if (records.Count == 0) return 0;
 
-        // Resolve CaseId / CaseType / DocumentId internal field names (best-effort; skip if unavailable).
         string? caseIdField = null;
         string? caseTypeField = null;
         string? documentIdField = null;
+        string? wilerforceDateField = null;
+        string? wilerforceFileNameField = null;
         try
         {
             await EnsureMetadataFieldMappingsAsync(records, libraryTitle).ConfigureAwait(false);
             _effectiveMetadataFieldMap.TryGetValue("CaseId", out caseIdField);
             _effectiveMetadataFieldMap.TryGetValue("CaseType", out caseTypeField);
             _effectiveMetadataFieldMap.TryGetValue("DocumentId", out documentIdField);
+            _effectiveMetadataFieldMap.TryGetValue("WilerforceDate", out wilerforceDateField);
+            _effectiveMetadataFieldMap.TryGetValue("WilerforceFileName", out wilerforceFileNameField);
         }
         catch (Exception ex)
         {
@@ -1559,36 +1594,24 @@ public class SharePointMigrationService
         }
 
         if (string.IsNullOrWhiteSpace(caseIdField) && string.IsNullOrWhiteSpace(caseTypeField) &&
-            string.IsNullOrWhiteSpace(documentIdField))
+            string.IsNullOrWhiteSpace(documentIdField) && string.IsNullOrWhiteSpace(wilerforceDateField) &&
+            string.IsNullOrWhiteSpace(wilerforceFileNameField))
         {
-            _logger.LogInformation("No CaseId/CaseType/DocumentId fields configured for library '{Library}'; skipping bulk metadata patch.", libraryTitle);
+            _logger.LogInformation("No metadata columns configured for library '{Library}'; skipping bulk metadata patch.", libraryTitle);
             return 0;
         }
 
-        _logger.LogInformation(
-            "Bulk metadata field mapping for '{Library}': CaseIdField={CaseIdField}, CaseTypeField={CaseTypeField}, DocumentIdField={DocumentIdField}",
-            libraryTitle,
-            caseIdField ?? "(none)",
-            caseTypeField ?? "(none)",
-            documentIdField ?? "(none)");
-
-        // Load the library root folder URL for building FolderServerRelativeUrl in CAML queries.
         var list = _web.Lists.GetByTitle(libraryTitle);
         _clientContextG.Load(list, l => l.RootFolder.ServerRelativeUrl);
         await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
         var rootFolderUrl = list.RootFolder.ServerRelativeUrl.TrimEnd('/');
 
-        // Group records by their case folder path (directory part, relative to library root).
-        // MappedPath example (YearAsLibrary): "2010/530341/filename.docx"
-        // After stripping yearPrefix: "530341/filename.docx" → folder = "530341"
         var caseGroups = records
-            .Where(r => r.Metadata.ContainsKey("CaseId") || r.Metadata.ContainsKey("CaseType") ||
-                        r.Metadata.ContainsKey("DocumentId"))
+            .Where(r => !string.IsNullOrWhiteSpace(r.MappedPath))
             .GroupBy(r =>
             {
-                var path = MetadataPatchRelativePath(r, yearPrefixToStrip);
+                var path = GetLibraryRelativeFilePath(r, yearPrefixToStrip);
                 var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                // Return the directory containing the file (all segments except the last).
                 return segs.Length >= 2 ? string.Join("/", segs[..^1]) : string.Empty;
             }, StringComparer.OrdinalIgnoreCase)
             .Where(g => !string.IsNullOrEmpty(g.Key))
@@ -1601,74 +1624,61 @@ public class SharePointMigrationService
         foreach (var caseGroup in caseGroups)
         {
             var caseFolderRelPath = caseGroup.Key;
-            // CaseId / CaseType are the same for every file in a case folder; any group member is fine.
-            var rep = caseGroup.First();
+            var rep = caseGroup.FirstOrDefault(r =>
+                         r.Metadata.TryGetValue("CaseId", out var c) && !string.IsNullOrWhiteSpace(c))
+                     ?? caseGroup.FirstOrDefault(r =>
+                         r.Metadata.TryGetValue("CaseType", out var t) && !string.IsNullOrWhiteSpace(t))
+                     ?? caseGroup.First();
             rep.Metadata.TryGetValue("CaseId", out var caseId);
             rep.Metadata.TryGetValue("CaseType", out var caseType);
-            // DocumentId is per file. caseGroup.First() is often case_*_documents.xml (no DocumentId in metadata),
-            // which caused every list item to skip DocumentId — only Wilberforce Case ID / Case Type were set.
-            var documentIdByDestFileName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rec in caseGroup)
-            {
-                if (!rec.Metadata.TryGetValue("DocumentId", out var did) || string.IsNullOrWhiteSpace(did))
-                    continue;
-                var canon = MetadataPatchRelativePath(rec, yearPrefixToStrip);
-                var destName = string.IsNullOrEmpty(canon)
-                    ? rec.Name
-                    : Path.GetFileName(canon.TrimEnd('/'));
-                if (string.IsNullOrWhiteSpace(destName))
-                    destName = rec.Name;
-                destName = CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(destName);
-                documentIdByDestFileName[destName] = did.Trim();
-            }
 
-            if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType) &&
-                documentIdByDestFileName.Count == 0)
-                continue;
+            var recordsByNormName = BuildRecordsByNormFileName(caseGroup, yearPrefixToStrip);
+            var documentIdByNormName = BuildDocumentIdByNormFileName(caseGroup, yearPrefixToStrip);
 
-            var fileServerRelativeUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rec in caseGroup)
-            {
-                var url = BuildServerRelativeFileUrlForCaseMetadataPatch(rootFolderUrl, yearPrefixToStrip, rec);
-                if (!string.IsNullOrEmpty(url))
-                    fileServerRelativeUrls.Add(url);
-            }
-
-            if (fileServerRelativeUrls.Count == 0)
-            {
-                _logger.LogWarning(
-                    "Could not build server-relative file URL(s) for case folder '{Folder}' in library '{Library}'; metadata patch skipped for this group.",
-                    caseFolderRelPath, libraryTitle);
-                totalFoldersFailed++;
-                continue;
-            }
-
+            var folderServerRelUrl = $"{rootFolderUrl}/{caseFolderRelPath}";
             try
             {
-                var patched = await PatchCaseMetadataOnFilesByServerRelativeUrlAsync(
-                        fileServerRelativeUrls,
-                        caseIdField, caseId, caseTypeField, caseType, documentIdField, documentIdByDestFileName)
-                    .ConfigureAwait(false);
-                totalPatched += patched;
+                var pending = new List<ListItem>();
+                ListItemCollectionPosition? pos = null;
 
-                if (_settings.PatchCaseTopFolderMetadataAfterFiles &&
-                    (!string.IsNullOrWhiteSpace(caseId) || !string.IsNullOrWhiteSpace(caseType)))
+                do
                 {
-                    var folderUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var rec in caseGroup)
+                    var camlQuery = new CamlQuery
                     {
-                        var rel = MetadataPatchRelativePath(rec, yearPrefixToStrip);
-                        if (TryGetTopCaseSubfolderRelativePath(rel, yearPrefixToStrip, out var folderRel))
-                            folderUrls.Add($"{rootFolderUrl.TrimEnd('/')}/{folderRel}");
-                    }
+                        FolderServerRelativeUrl = folderServerRelUrl,
+                        ViewXml = "<View Scope='FilesOnly'><RowLimit>100</RowLimit></View>"
+                    };
+                    if (pos != null) camlQuery.ListItemCollectionPosition = pos;
 
-                    foreach (var folderUrl in folderUrls)
+                    var items = list.GetItems(camlQuery);
+                    _clientContextG.Load(items, ii => ii.ListItemCollectionPosition,
+                        ii => ii.Include(item => item.Id, item => item["FileLeafRef"]));
+                    await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
+
+                    pending.AddRange(items);
+                    pos = items.ListItemCollectionPosition;
+
+                    while (pending.Count >= 100)
                     {
-                        var n = await PatchCaseFolderCaseMetadataAsync(
-                                folderUrl, caseIdField, caseId, caseTypeField, caseType)
-                            .ConfigureAwait(false);
-                        totalPatched += n;
+                        await FlushItemBatchAsync(
+                            pending.Take(100).ToList(),
+                            caseIdField, caseId, caseTypeField, caseType,
+                            documentIdField, wilerforceDateField, wilerforceFileNameField,
+                            recordsByNormName, documentIdByNormName).ConfigureAwait(false);
+                        totalPatched += 100;
+                        pending.RemoveRange(0, 100);
                     }
+                }
+                while (pos != null);
+
+                if (pending.Count > 0)
+                {
+                    await FlushItemBatchAsync(
+                        pending,
+                        caseIdField, caseId, caseTypeField, caseType,
+                        documentIdField, wilerforceDateField, wilerforceFileNameField,
+                        recordsByNormName, documentIdByNormName).ConfigureAwait(false);
+                    totalPatched += pending.Count;
                 }
             }
             catch (Exception ex)
@@ -1682,6 +1692,55 @@ public class SharePointMigrationService
         _logger.LogInformation("Bulk metadata patch complete for '{Library}': {Patched} items patched, {Failed} folder errors.",
             libraryTitle, totalPatched, totalFoldersFailed);
         return totalPatched;
+    }
+
+    private async Task FlushItemBatchAsync(
+        List<ListItem> items,
+        string? caseIdField, string? caseId,
+        string? caseTypeField, string? caseType,
+        string? documentIdField,
+        string? wilerforceDateField, string? wilerforceFileNameField,
+        IReadOnlyDictionary<string, FileRecord> recordsByNormFileName,
+        IReadOnlyDictionary<string, string> documentIdByNormFileName)
+    {
+        foreach (var item in items)
+        {
+            if (!string.IsNullOrWhiteSpace(caseIdField) && !string.IsNullOrWhiteSpace(caseId))
+                item[caseIdField] = caseId;
+            if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
+                item[caseTypeField] = caseType;
+
+            var leaf = GetListItemFileLeafRef(item);
+            var normLeaf = string.IsNullOrWhiteSpace(leaf)
+                ? string.Empty
+                : CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(leaf);
+
+            if (!string.IsNullOrWhiteSpace(documentIdField) &&
+                !string.IsNullOrWhiteSpace(normLeaf) &&
+                documentIdByNormFileName.TryGetValue(normLeaf, out var docId) &&
+                !string.IsNullOrWhiteSpace(docId))
+                item[documentIdField] = docId;
+
+            if (!string.IsNullOrWhiteSpace(normLeaf) &&
+                recordsByNormFileName.TryGetValue(normLeaf, out var rec))
+            {
+                if (!string.IsNullOrWhiteSpace(wilerforceFileNameField))
+                {
+                    var wfn = rec.Metadata.TryGetValue("WilerforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                        ? wfMeta
+                        : rec.Name;
+                    if (!string.IsNullOrWhiteSpace(wfn))
+                        item[wilerforceFileNameField] = wfn;
+                }
+
+                if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
+                    rec.Metadata.TryGetValue("WilerforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    item[wilerforceDateField] = wd;
+            }
+
+            item.SystemUpdate();
+        }
+        await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1780,7 +1839,11 @@ public class SharePointMigrationService
     private async Task<int> PatchCaseFolderCaseMetadataAsync(
         string folderServerRelativeUrl,
         string? caseIdField, string? caseId,
-        string? caseTypeField, string? caseType)
+        string? caseTypeField, string? caseType,
+        string? documentIdField,
+        string? wilerforceDateField, string? wilerforceFileNameField,
+        IReadOnlyDictionary<string, FileRecord> recordsByNormFileName,
+        IReadOnlyDictionary<string, string> documentIdByNormFileName)
     {
         if (string.IsNullOrWhiteSpace(caseId) && string.IsNullOrWhiteSpace(caseType))
             return 0;
@@ -1806,6 +1869,35 @@ public class SharePointMigrationService
                 item[caseIdField] = caseId;
             if (!string.IsNullOrWhiteSpace(caseTypeField) && !string.IsNullOrWhiteSpace(caseType))
                 item[caseTypeField] = caseType;
+
+            var leaf = GetListItemFileLeafRef(item);
+            var normLeaf = string.IsNullOrWhiteSpace(leaf)
+                ? string.Empty
+                : CaseDocumentMetadataService.NormalizeFileNameForMetadataMatch(leaf);
+
+            if (!string.IsNullOrWhiteSpace(documentIdField) &&
+                !string.IsNullOrWhiteSpace(normLeaf) &&
+                documentIdByNormFileName.TryGetValue(normLeaf, out var docId) &&
+                !string.IsNullOrWhiteSpace(docId))
+                item[documentIdField] = docId;
+
+            if (!string.IsNullOrWhiteSpace(normLeaf) &&
+                recordsByNormFileName.TryGetValue(normLeaf, out var rec))
+            {
+                if (!string.IsNullOrWhiteSpace(wilerforceFileNameField))
+                {
+                    var wfn = rec.Metadata.TryGetValue("WilerforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                        ? wfMeta
+                        : rec.Name;
+                    if (!string.IsNullOrWhiteSpace(wfn))
+                        item[wilerforceFileNameField] = wfn;
+                }
+
+                if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
+                    rec.Metadata.TryGetValue("WilerforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    item[wilerforceDateField] = wd;
+            }
+
             item.SystemUpdate();
             await ExecuteQueryWithRetryAsync().ConfigureAwait(false);
             return 1;

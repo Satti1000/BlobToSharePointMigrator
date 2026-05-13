@@ -81,6 +81,13 @@ public class CaseDocumentMetadataService
                 }
             }
 
+            foreach (var record in recordsInCase)
+            {
+                if (IsCaseManifestFile(record.Name))
+                    continue;
+                EnsureMetadataDictionary(record)["WilerforceFileName"] = record.Name;
+            }
+
             if (!_settings.AssignDocumentIdFromCaseXml || xmlLookupByCaseFolder is null)
                 continue;
 
@@ -113,10 +120,12 @@ public class CaseDocumentMetadataService
                 if (IsCaseManifestFile(record.Name))
                     continue;
 
-                if (manifest.TryAssignDocumentId(record.Name, record.ContentType, out var documentId, out var matchMode))
+                if (manifest.TryAssignDocumentId(record.Name, record.ContentType, out var documentId, out var manifestDocumentDate, out var matchMode))
                 {
                     EnsureMetadataDictionary(record)["DocumentId"] = documentId;
                     documentIdAssigned++;
+                    if (!string.IsNullOrWhiteSpace(manifestDocumentDate))
+                        EnsureMetadataDictionary(record)["WilerforceDate"] = manifestDocumentDate;
                     _logger.LogDebug("Assigned DocumentId via {MatchMode} match: {BlobPath} -> {DocumentId}",
                         matchMode, record.BlobPath, documentId);
                 }
@@ -281,6 +290,19 @@ public class CaseDocumentMetadataService
     private static bool IsCaseManifestFile(string fileName) =>
         CaseManifestRegex.IsMatch(NormalizeFileNameForMatch(fileName ?? string.Empty));
 
+    /// <summary>Reads raw document date text from common manifest attribute/element names before parsing.</summary>
+    private static string? ReadDocumentDateRawFromXml(XElement element)
+    {
+        var fromAttr = element.Attribute("DocumentDate")?.Value?.Trim()
+            ?? element.Attribute("Document_Date")?.Value?.Trim()
+            ?? element.Attribute("Date")?.Value?.Trim();
+        if (!string.IsNullOrWhiteSpace(fromAttr))
+            return fromAttr;
+        var child = element.Element("DocumentDate") ?? element.Element("Document_Date") ?? element.Element("Date");
+        var v = child?.Value?.Trim();
+        return string.IsNullOrWhiteSpace(v) ? null : v;
+    }
+
     /// <summary>
     /// Parses manifest <c>DocumentDate</c> values; duplicate rows for the same file use the latest date (client rule).
     /// </summary>
@@ -305,6 +327,11 @@ public class CaseDocumentMetadataService
 
         return null;
     }
+
+    private static string? FormatWilerforceDateFromManifest(DateTime? documentDate) =>
+        documentDate.HasValue
+            ? documentDate.Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)
+            : null;
 
     private static IEnumerable<ManifestDocument> OrderManifestCandidatesForAssignment(IEnumerable<ManifestDocument> candidates) =>
         candidates
@@ -344,9 +371,7 @@ public class CaseDocumentMetadataService
                     type: element.Attribute("Type")?.Value?.Trim() ?? string.Empty,
                     category: element.Attribute("Category")?.Value?.Trim() ?? string.Empty,
                     source: element.Attribute("Source")?.Value?.Trim() ?? string.Empty,
-                    documentDate: TryParseManifestDocumentDate(
-                        element.Attribute("DocumentDate")?.Value
-                        ?? element.Element("DocumentDate")?.Value),
+                    documentDate: TryParseManifestDocumentDate(ReadDocumentDateRawFromXml(element)),
                     sequence: index))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Id) && !string.IsNullOrWhiteSpace(x.Name))
                 .ToList()
@@ -403,15 +428,17 @@ public class CaseDocumentMetadataService
             return new CaseManifestIndex(exact, normalized, typed, stems, folderDocuments);
         }
 
-        public bool TryAssignDocumentId(string fileName, string? contentType, out string documentId, out string matchMode)
+        public bool TryAssignDocumentId(string fileName, string? contentType, out string documentId, out string? manifestDocumentDate, out string matchMode)
         {
             documentId = string.Empty;
+            manifestDocumentDate = null;
             matchMode = string.Empty;
 
             if (TryTakeUnassigned(_exactNameLookup, fileName, out var exact))
             {
                 exact.Assigned = true;
                 documentId = exact.Id;
+                manifestDocumentDate = FormatWilerforceDateFromManifest(exact.DocumentDate);
                 matchMode = "exact";
                 return true;
             }
@@ -421,6 +448,7 @@ public class CaseDocumentMetadataService
             {
                 normalized.Assigned = true;
                 documentId = normalized.Id;
+                manifestDocumentDate = FormatWilerforceDateFromManifest(normalized.DocumentDate);
                 matchMode = "normalized";
                 return true;
             }
@@ -429,6 +457,7 @@ public class CaseDocumentMetadataService
             {
                 typed.Assigned = true;
                 documentId = typed.Id;
+                manifestDocumentDate = FormatWilerforceDateFromManifest(typed.DocumentDate);
                 matchMode = "name+type";
                 return true;
             }
@@ -439,6 +468,7 @@ public class CaseDocumentMetadataService
             {
                 stem.Assigned = true;
                 documentId = stem.Id;
+                manifestDocumentDate = FormatWilerforceDateFromManifest(stem.DocumentDate);
                 matchMode = "extensionless";
                 return true;
             }
@@ -511,6 +541,7 @@ public class CaseDocumentMetadataService
         public string Type { get; }
         public string Category { get; }
         public string Source { get; }
+        /// <summary>Parsed manifest document date; used for duplicate-row ordering and Wilerforce Date text on match.</summary>
         public DateTime? DocumentDate { get; }
         public int Sequence { get; }
         public string NormalizedName { get; }

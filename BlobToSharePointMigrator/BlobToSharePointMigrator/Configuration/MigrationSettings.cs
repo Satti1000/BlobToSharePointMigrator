@@ -14,6 +14,8 @@ public class MigrationSettings
     public string SharePointCaseIdColumnDisplayName     { get; set; } = string.Empty;
     public string SharePointCaseTypeColumnDisplayName   { get; set; } = string.Empty;
     public string SharePointDocumentIdColumnDisplayName { get; set; } = string.Empty;
+    public string SharePointWilerforceDateColumnDisplayName { get; set; } = "Wilerforce Date";
+    public string SharePointWilerforceFileNameColumnDisplayName { get; set; } = "Wilerforce File Name";
     public string SharePointDocumentLibrary { get; set; } = "Documents";
     public List<string> AllowedExtensions   { get; set; } = new() { ".pdf", ".csv", ".html", ".txt", ".xml" };
     public string MappingFile               { get; set; } = "mapping.json";
