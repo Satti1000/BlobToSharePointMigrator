@@ -85,7 +85,7 @@ public class CaseDocumentMetadataService
             {
                 if (IsCaseManifestFile(record.Name))
                     continue;
-                EnsureMetadataDictionary(record)["WilerforceFileName"] = record.Name;
+                EnsureMetadataDictionary(record)["WilberforceFileName"] = record.Name;
             }
 
             if (!_settings.AssignDocumentIdFromCaseXml || xmlLookupByCaseFolder is null)
@@ -125,7 +125,7 @@ public class CaseDocumentMetadataService
                     EnsureMetadataDictionary(record)["DocumentId"] = documentId;
                     documentIdAssigned++;
                     if (!string.IsNullOrWhiteSpace(manifestDocumentDate))
-                        EnsureMetadataDictionary(record)["WilerforceDate"] = manifestDocumentDate;
+                        EnsureMetadataDictionary(record)["WilberforceDate"] = manifestDocumentDate;
                     _logger.LogDebug("Assigned DocumentId via {MatchMode} match: {BlobPath} -> {DocumentId}",
                         matchMode, record.BlobPath, documentId);
                 }
@@ -164,22 +164,30 @@ public class CaseDocumentMetadataService
             }
         }
 
+        var wilberforceFileNameCount = targetRecords.Count(r => r.Metadata.ContainsKey("WilberforceFileName"));
+        var wilberforceDateCount = targetRecords.Count(r =>
+            r.Metadata.TryGetValue("WilberforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd));
+
         if (!_settings.AssignDocumentIdFromCaseXml)
         {
             _logger.LogInformation(
-                "Case metadata enrichment complete: CaseId={CaseIdAssigned}, CaseType={CaseTypeAssigned}; DocumentId from manifest disabled (AssignDocumentIdFromCaseXml=false).",
+                "Case metadata enrichment complete: CaseId={CaseIdAssigned}, CaseType={CaseTypeAssigned}, WilberforceFileName={WilberforceFileName}, WilberforceDate={WilberforceDate}; DocumentId from manifest disabled (AssignDocumentIdFromCaseXml=false).",
                 caseIdAssigned,
-                caseTypeAssigned);
+                caseTypeAssigned,
+                wilberforceFileNameCount,
+                wilberforceDateCount);
             return;
         }
 
         _logger.LogInformation(
-            "Case metadata enrichment complete: CaseId={CaseIdAssigned}, CaseType={CaseTypeAssigned}, DocumentId={DocumentIdAssigned}, DocumentIdUnmatched={DocumentIdUnmatched}, MissingManifest={MissingManifest}",
+            "Case metadata enrichment complete: CaseId={CaseIdAssigned}, CaseType={CaseTypeAssigned}, DocumentId={DocumentIdAssigned}, DocumentIdUnmatched={DocumentIdUnmatched}, MissingManifest={MissingManifest}, WilberforceFileName={WilberforceFileName}, WilberforceDate={WilberforceDate}",
             caseIdAssigned,
             caseTypeAssigned,
             documentIdAssigned,
             documentIdUnmatched,
-            manifestMissing);
+            manifestMissing,
+            wilberforceFileNameCount,
+            wilberforceDateCount);
         if (folderDocumentIdAssigned > 0)
         {
             _logger.LogInformation("Folder-level DocumentId assignments: {FolderDocumentIdAssigned}", folderDocumentIdAssigned);
@@ -294,11 +302,15 @@ public class CaseDocumentMetadataService
     private static string? ReadDocumentDateRawFromXml(XElement element)
     {
         var fromAttr = element.Attribute("DocumentDate")?.Value?.Trim()
+            ?? element.Attribute("Document Date")?.Value?.Trim()
             ?? element.Attribute("Document_Date")?.Value?.Trim()
             ?? element.Attribute("Date")?.Value?.Trim();
         if (!string.IsNullOrWhiteSpace(fromAttr))
             return fromAttr;
-        var child = element.Element("DocumentDate") ?? element.Element("Document_Date") ?? element.Element("Date");
+        var child = element.Element("DocumentDate")
+            ?? element.Element("Document Date")
+            ?? element.Element("Document_Date")
+            ?? element.Element("Date");
         var v = child?.Value?.Trim();
         return string.IsNullOrWhiteSpace(v) ? null : v;
     }
@@ -328,7 +340,7 @@ public class CaseDocumentMetadataService
         return null;
     }
 
-    private static string? FormatWilerforceDateFromManifest(DateTime? documentDate) =>
+    private static string? FormatWilberforceDateFromManifest(DateTime? documentDate) =>
         documentDate.HasValue
             ? documentDate.Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)
             : null;
@@ -438,7 +450,7 @@ public class CaseDocumentMetadataService
             {
                 exact.Assigned = true;
                 documentId = exact.Id;
-                manifestDocumentDate = FormatWilerforceDateFromManifest(exact.DocumentDate);
+                manifestDocumentDate = FormatWilberforceDateFromManifest(exact.DocumentDate);
                 matchMode = "exact";
                 return true;
             }
@@ -448,7 +460,7 @@ public class CaseDocumentMetadataService
             {
                 normalized.Assigned = true;
                 documentId = normalized.Id;
-                manifestDocumentDate = FormatWilerforceDateFromManifest(normalized.DocumentDate);
+                manifestDocumentDate = FormatWilberforceDateFromManifest(normalized.DocumentDate);
                 matchMode = "normalized";
                 return true;
             }
@@ -457,7 +469,7 @@ public class CaseDocumentMetadataService
             {
                 typed.Assigned = true;
                 documentId = typed.Id;
-                manifestDocumentDate = FormatWilerforceDateFromManifest(typed.DocumentDate);
+                manifestDocumentDate = FormatWilberforceDateFromManifest(typed.DocumentDate);
                 matchMode = "name+type";
                 return true;
             }
@@ -468,7 +480,7 @@ public class CaseDocumentMetadataService
             {
                 stem.Assigned = true;
                 documentId = stem.Id;
-                manifestDocumentDate = FormatWilerforceDateFromManifest(stem.DocumentDate);
+                manifestDocumentDate = FormatWilberforceDateFromManifest(stem.DocumentDate);
                 matchMode = "extensionless";
                 return true;
             }
@@ -541,7 +553,7 @@ public class CaseDocumentMetadataService
         public string Type { get; }
         public string Category { get; }
         public string Source { get; }
-        /// <summary>Parsed manifest document date; used for duplicate-row ordering and Wilerforce Date text on match.</summary>
+        /// <summary>Parsed manifest document date; used for duplicate-row ordering and Wilberforce Date text on match.</summary>
         public DateTime? DocumentDate { get; }
         public int Sequence { get; }
         public string NormalizedName { get; }

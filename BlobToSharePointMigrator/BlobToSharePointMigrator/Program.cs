@@ -21,22 +21,30 @@ var config = new ConfigurationBuilder()
     .AddEnvironmentVariables()
     .Build();
 
-var configurationForSerilog = new ConfigurationBuilder()
-    .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .AddEnvironmentVariables()
-    .Build();
-
-Log.Logger = new LoggerConfiguration()
-    .ReadFrom.Configuration(configurationForSerilog)
-    .CreateLogger();
-
 var migrationSection = config.GetSection("Migration");
 if (!migrationSection.Exists())
     throw new InvalidOperationException("'Migration' section was not found in appsettings.json");
 
 var migrationSettings = migrationSection.Get<MigrationSettings>()
     ?? throw new InvalidOperationException("Migration settings could not be bound from the 'Migration' section.");
+
+ApplyLegacySimpleEtlCompatibility(config, migrationSection, migrationSettings);
+NormalizeWilberforceColumnDisplayNames(migrationSettings);
+ApplyYearScopedOutputFileNames(migrationSettings);
+
+var runLogPath = Path.IsPathRooted(migrationSettings.LogFile)
+    ? migrationSettings.LogFile
+    : Path.Combine(AppContext.BaseDirectory, migrationSettings.LogFile);
+var logDir = Path.GetDirectoryName(runLogPath);
+if (!string.IsNullOrWhiteSpace(logDir))
+    Directory.CreateDirectory(logDir);
+
+const string logOutputTemplate = "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}";
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Debug()
+    .WriteTo.Console(outputTemplate: logOutputTemplate)
+    .WriteTo.File(runLogPath, shared: true, outputTemplate: logOutputTemplate)
+    .CreateLogger();
 
 var services = new ServiceCollection()
     .AddLogging(b => b
@@ -58,6 +66,7 @@ var spServiceProbe = new SharePointMigrationService(migrationSettings, loggerFac
 var reportSvc = new ReportService(migrationSettings, loggerFactory.CreateLogger<ReportService>());
 var caseMetadataSvc = new CaseDocumentMetadataService(migrationSettings, loggerFactory.CreateLogger<CaseDocumentMetadataService>());
 var logger = loggerFactory.CreateLogger("Pipeline");
+logger.LogInformation("Run log file: {LogFile}", runLogPath);
 
 // Client visibility: always emit BlobFolderPrefix at start of the log (empty = no prefix filter on inventory).
 var blobFolderPrefixLogValue = string.IsNullOrWhiteSpace(migrationSettings.BlobFolderPrefix)
@@ -66,6 +75,100 @@ var blobFolderPrefixLogValue = string.IsNullOrWhiteSpace(migrationSettings.BlobF
 logger.LogInformation("Migration:BlobFolderPrefix = {BlobFolderPrefix}", blobFolderPrefixLogValue);
 if (migrationSettings.MaxParallelJobs > 1)
     logger.LogInformation("Migration:MaxParallelJobs={Count} — overlapping jobs against the same library can trigger Save Conflict (JobError); use 1 while debugging collisions.", migrationSettings.MaxParallelJobs);
+logger.LogInformation("Migration:UseYyyyCaseNumberPath={Value}", migrationSettings.UseYyyyCaseNumberPath);
+logger.LogInformation("Migration:YearAsLibrary={Value}", migrationSettings.YearAsLibrary);
+logger.LogInformation(
+    "Wilberforce columns: File Name='{FileName}', Date='{Date}' (SharePoint list must use these display names)",
+    migrationSettings.SharePointWilberforceFileNameColumnDisplayName,
+    migrationSettings.SharePointWilberforceDateColumnDisplayName);
+if (migrationSettings.TryGetMigrationYearScope(out var logScopeStart, out var logScopeEnd))
+    logger.LogInformation("Migration year scope: {Start}-{End}", logScopeStart, logScopeEnd);
+
+static void ApplyLegacySimpleEtlCompatibility(IConfiguration config, IConfigurationSection migrationSection, MigrationSettings migrationSettings)
+{
+    if (migrationSection["UseYyyyCaseNumberPath"] is null)
+    {
+        var legacy = config["SimpleETL:UseYyyyCaseNumberPath"];
+        if (!string.IsNullOrWhiteSpace(legacy))
+            migrationSettings.UseYyyyCaseNumberPath = ParseFlexibleBool(legacy, migrationSettings.UseYyyyCaseNumberPath);
+    }
+
+    if (migrationSection["YearAsLibrary"] is null)
+    {
+        var legacy = config["SimpleETL:UseYearDrives"];
+        if (!string.IsNullOrWhiteSpace(legacy))
+            migrationSettings.YearAsLibrary = ParseFlexibleBool(legacy, migrationSettings.YearAsLibrary);
+    }
+
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointWilberforceDateColumnDisplayName))
+    {
+        var legacy = config["SimpleETL:SHAREPOINT_WILERFORCE_DATE_COLUMN_DISPLAY_NAME"]
+            ?? config["SimpleETL:SHAREPOINT_WILBERFORCE_DATE_COLUMN_DISPLAY_NAME"];
+        if (!string.IsNullOrWhiteSpace(legacy))
+            migrationSettings.SharePointWilberforceDateColumnDisplayName = legacy.Trim();
+    }
+
+    if (string.IsNullOrWhiteSpace(migrationSettings.SharePointWilberforceFileNameColumnDisplayName))
+    {
+        var legacy = config["SimpleETL:SHAREPOINT_WILERFORCE_FILE_NAME_COLUMN_DISPLAY_NAME"]
+            ?? config["SimpleETL:SHAREPOINT_WILBERFORCE_FILE_NAME_COLUMN_DISPLAY_NAME"];
+        if (!string.IsNullOrWhiteSpace(legacy))
+            migrationSettings.SharePointWilberforceFileNameColumnDisplayName = legacy.Trim();
+    }
+}
+
+static void ApplyYearScopedOutputFileNames(MigrationSettings settings)
+{
+    if (!settings.TryGetMigrationYearScope(out var startYear, out var endYear))
+        return;
+
+    var yearTag = startYear == endYear ? startYear.ToString() : $"{startYear}-{endYear}";
+    settings.LogFile = UseYearScopedDefault(settings.LogFile, "migration-log.txt", $"{yearTag}-migration.log");
+    settings.ReportFile = UseYearScopedDefault(settings.ReportFile, "migration-report.csv", $"{yearTag}-migration-report.csv");
+    settings.FailedItemsFile = UseYearScopedDefault(settings.FailedItemsFile, "failed-files.csv", $"{yearTag}-failed-files.csv");
+    settings.OverwriteAuditReportFile = UseYearScopedDefault(settings.OverwriteAuditReportFile, "overwrite-audit.csv", $"{yearTag}-overwrite-audit.csv");
+    settings.DeltaTrackingFile = UseYearScopedDefault(settings.DeltaTrackingFile, "migrated-files.json", $"{yearTag}-migrated-files.json");
+}
+
+static string UseYearScopedDefault(string configured, string defaultFileName, string yearScopedFileName)
+{
+    if (string.IsNullOrWhiteSpace(configured))
+        return yearScopedFileName;
+    return string.Equals(Path.GetFileName(configured), defaultFileName, StringComparison.OrdinalIgnoreCase)
+        ? yearScopedFileName
+        : configured;
+}
+
+static void NormalizeWilberforceColumnDisplayNames(MigrationSettings migrationSettings)
+{
+    migrationSettings.SharePointWilberforceDateColumnDisplayName =
+        FixWilberforceTypoInLabel(migrationSettings.SharePointWilberforceDateColumnDisplayName, "Wilberforce Date");
+    migrationSettings.SharePointWilberforceFileNameColumnDisplayName =
+        FixWilberforceTypoInLabel(migrationSettings.SharePointWilberforceFileNameColumnDisplayName, "Wilberforce File Name");
+}
+
+static string FixWilberforceTypoInLabel(string? configured, string canonical)
+{
+    if (string.IsNullOrWhiteSpace(configured))
+        return canonical;
+    return configured.Replace("Wilerforce", "Wilberforce", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool ParseFlexibleBool(string? s, bool fallback)
+{
+    if (string.IsNullOrWhiteSpace(s))
+        return fallback;
+    s = s.Trim();
+    if (bool.TryParse(s, out var b))
+        return b;
+    if (int.TryParse(s, out var i))
+        return i != 0;
+    if (s.Equals("Y", StringComparison.OrdinalIgnoreCase))
+        return true;
+    if (s.Equals("N", StringComparison.OrdinalIgnoreCase))
+        return false;
+    return fallback;
+}
 
 static void ValidateStartupSettings(MigrationSettings migrationSettings)
 {
@@ -165,26 +268,8 @@ static string BuildSummaryYearLabel(MigrationSettings s, List<FileRecord> files)
     return string.Join(", ", ordered.Take(5)) + ", …";
 }
 
-static bool TryGetConfiguredYearScope(MigrationSettings s, out int startYear, out int endYear)
-{
-    if (s.MigrationYear > 0)
-    {
-        startYear = s.MigrationYear;
-        endYear = s.MigrationYear;
-        return true;
-    }
-
-    if (s.MigrationYearStart > 0 && s.MigrationYearEnd > 0)
-    {
-        startYear = s.MigrationYearStart;
-        endYear = s.MigrationYearEnd;
-        return true;
-    }
-
-    startYear = 0;
-    endYear = 0;
-    return false;
-}
+static bool TryGetConfiguredYearScope(MigrationSettings s, out int startYear, out int endYear) =>
+    s.TryGetMigrationYearScope(out startYear, out endYear);
 
 static bool TryGetMappedPathYear(FileRecord record, out int year)
 {
@@ -195,6 +280,16 @@ static bool TryGetMappedPathYear(FileRecord record, out int year)
 
     year = 0;
     return false;
+}
+
+static bool RecordMatchesMigrationYearScope(FileRecord r, MigrationSettings settings, int startYear, int endYear)
+{
+    if (settings.UseYyyyCaseNumberPath)
+        return TryGetMappedPathYear(r, out var mappedY) && mappedY >= startYear && mappedY <= endYear;
+    var aligned = CaseDocumentsPathRules.TryGetAlignedYear(r.BlobPath);
+    return aligned != null &&
+           int.TryParse(aligned, out var blobY) &&
+           blobY >= startYear && blobY <= endYear;
 }
 
 static bool MigrationJobHasSaveConflictErrors(MigrationJobInfo info)
@@ -303,8 +398,12 @@ try
     var allowed = records.Where(r => r.IsAllowed).ToList();
     var skipped = records.Where(r => !r.IsAllowed).ToList();
 
-    foreach (var s in skipped)
-        logger.LogInformation("Skipped: {File} ({Reason})", s.BlobPath, s.SkipReason);
+    if (skipped.Count > 0)
+    {
+        logger.LogInformation("Skipped {Count} file(s) (invalid/filtered).", skipped.Count);
+        foreach (var s in skipped)
+            logger.LogDebug("Skipped: {File} ({Reason})", s.BlobPath, s.SkipReason);
+    }
 
     var toMigrate = migrationSettings.MetadataOnlyMode
         ? allowed.ToList()
@@ -314,20 +413,20 @@ try
         logger.LogInformation("MetadataOnlyMode is enabled; DeltaMode skip is ignored so existing SharePoint files can be patched.");
     }
 
-    // Optional year filter on mapped destination (YYYY/CaseNumber/...)
-    if (TryGetConfiguredYearScope(migrationSettings, out var filterStartYear, out var filterEndYear) &&
-        migrationSettings.UseYyyyCaseNumberPath)
+    // Optional year filter (mapped YYYY/ when UseYyyyCaseNumberPath; else aligned blob calendar year).
+    if (TryGetConfiguredYearScope(migrationSettings, out var filterStartYear, out var filterEndYear))
     {
         var before = toMigrate.Count;
         toMigrate = toMigrate
-            .Where(r => TryGetMappedPathYear(r, out var year) && year >= filterStartYear && year <= filterEndYear)
+            .Where(r => RecordMatchesMigrationYearScope(r, migrationSettings, filterStartYear, filterEndYear))
             .ToList();
 
         var scopeLabel = filterStartYear == filterEndYear
             ? filterStartYear.ToString()
             : $"{filterStartYear}-{filterEndYear}";
-        logger.LogInformation("Applied migration year scope filter: kept {Kept} of {Before} files for year scope {YearScope}",
-            toMigrate.Count, before, scopeLabel);
+        var mode = migrationSettings.UseYyyyCaseNumberPath ? "mapped path (YYYY prefix)" : "blob aligned year";
+        logger.LogInformation("Applied migration year scope filter ({Mode}): kept {Kept} of {Before} files for year scope {YearScope}",
+            mode, toMigrate.Count, before, scopeLabel);
     }
     if (migrationSettings.MaxFilesToMigrate > 0 && toMigrate.Count > migrationSettings.MaxFilesToMigrate)
     {
@@ -346,9 +445,12 @@ try
 
     logger.LogInformation("Files to migrate (after delta): {Count} of {Total}", toMigrate.Count, allowed.Count);
 
-    logger.LogInformation("STEP 2.5/5 - Enriching CaseId, CaseType, DocumentId, and Wilerforce fields (paths; manifest when AssignDocumentIdFromCaseXml is true)...");
+    logger.LogInformation("STEP 2.5/5 - Enriching CaseId, CaseType, DocumentId, and Wilberforce fields (paths; manifest when AssignDocumentIdFromCaseXml is true)...");
     await caseMetadataSvc.EnrichAsync(toMigrate, records, blobService.DownloadBlobAsync);
-    logger.LogInformation("STEP 2.5/5 - Case metadata enrichment finished.");
+    logger.LogInformation(
+        "STEP 2.5/5 - Case metadata enrichment finished. WilberforceFileName on plan={FileNameCount}, WilberforceDate on plan={DateCount}",
+        toMigrate.Count(r => r.Metadata.ContainsKey("WilberforceFileName")),
+        toMigrate.Count(r => r.Metadata.TryGetValue("WilberforceDate", out var d) && !string.IsNullOrWhiteSpace(d)));
 
     // Estimate unique case-folder count (YYYY/CaseNumber) when that mapping mode is active.
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -375,9 +477,10 @@ try
         logger.LogInformation(migrationSettings.MetadataOnlyMode
             ? "No files to patch (all records were filtered or invalid)."
             : "No files to migrate (all already migrated or filtered)");
-        reportSvc.SaveDeltaTracking();
+        var emptyArtifacts = reportSvc.WriteRunArtifacts(new List<MigrationResult>(), Array.Empty<OverwriteAuditRow>());
         reportSvc.PrintSummary(new List<MigrationResult>(), skipped, 0, records.Count, toMigrate.Count, 0, 0,
-            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate));
+            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate), 0, 0, 0, 0,
+            runLogPath, emptyArtifacts);
         Environment.Exit(0);
     }
 
@@ -408,11 +511,10 @@ try
             };
         }).ToList();
 
-        reportSvc.WriteReport(metadataOnlyResults);
-        logger.LogInformation("Metadata-only complete: attempted {Attempted} files, patched {Patched} existing SharePoint list items. No files were uploaded or overwritten.",
-            toMigrate.Count, patched);
+        var metadataArtifacts = reportSvc.WriteRunArtifacts(metadataOnlyResults, Array.Empty<OverwriteAuditRow>());
         reportSvc.PrintSummary(metadataOnlyResults, skipped, 0, records.Count, toMigrate.Count, 0, 0,
-            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate));
+            migrationSettings.ReportExistingFilesAsOverwritten, BuildSummaryYearLabel(migrationSettings, toMigrate), 0, 0, 0, 0,
+            runLogPath, metadataArtifacts, metadataPatchedCount: patched);
         Environment.Exit(0);
     }
 
@@ -574,11 +676,12 @@ try
                     var retryDelaySec = Math.Max(5, migrationSettings.MigrationJobSaveConflictRetryDelaySeconds);
 
                     MigrationJobInfo finalJobInfo = null!;
-                    for (var attempt = 0; ; attempt++)
+                    var maxSubmitAttempts = Math.Max(1, maxSaveConflictRetries + 1);
+                    for (var attempt = 0; attempt < maxSubmitAttempts; attempt++)
                     {
                         var jobInfo = await batchSpService.SubmitMigrationJobAsync(batchForSubmit, blobService.DownloadBlobAsync, targetLibrary);
                         PropagateSubmittedCanonicalPaths(batch, batchForSubmit);
-                        logger.LogInformation("Migration job submitted: {JobId} (submit attempt {Attempt})", jobInfo.JobId, attempt + 1);
+                        logger.LogInformation("Migration job submitted: {JobId} (submit attempt {Attempt}/{MaxAttempts})", jobInfo.JobId, attempt + 1, maxSubmitAttempts);
 
                         finalJobInfo = await batchSpService.PollMigrationJobAsync(
                             jobInfo.JobId,
@@ -590,7 +693,7 @@ try
                         var saveConflict = MigrationJobHasSaveConflictErrors(finalJobInfo);
                         var underProcessed = finalJobInfo.ProcessedFileCount < batch.Count;
                         var badStatus = finalJobInfo.Status == "CompletedWithErrors" || finalJobInfo.Status == "Failed";
-                        var canRetry = attempt < maxSaveConflictRetries && saveConflict && underProcessed && badStatus;
+                        var canRetry = attempt + 1 < maxSubmitAttempts && saveConflict && underProcessed && badStatus;
 
                         if (!canRetry)
                             break;
@@ -667,8 +770,6 @@ try
                         // Strip leading "YYYY/" from DestPath/SharePointUrl when YearAsLibrary is active
                         // so the report shows the correct path-within-library (no double year).
                         var destPath = StripLibraryPrefix(record.MappedPath, targetLibrary);
-
-                        logger.LogInformation("Destination PAth : {destPath}", destPath);
 
                         var result = new BlobToSharePointMigrator.Models.MigrationResult
                         {
@@ -747,11 +848,11 @@ try
         await Task.WhenAll(tasks);
     }
 
-    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilerforce Date / Wilerforce File Name) ───────────────────────
+    // ── STEP 5/5: Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilberforce Date / Wilberforce File Name) ───────────────────────
     var successBlobPaths = new HashSet<string>(allResults
         .Where(r => r.Status is "Success" or "PartialSuccess")
         .Select(r => r.SourceFile), StringComparer.OrdinalIgnoreCase);
-    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilerforce fields)...");
+    logger.LogInformation("STEP 5/5 - Bulk CSOM metadata patch (CaseId / CaseType / DocumentId / Wilberforce File Name / Wilberforce Date)...");
     {
         var metaRecords = toMigrate.Where(r => IsMetadataPatchEligibleFileRecord(r, successBlobPaths)).ToList();
 
@@ -801,10 +902,15 @@ try
         .ThenBy(r => r.DestPath, StringComparer.OrdinalIgnoreCase)
         .ToList();
 
-    reportSvc.SaveDeltaTracking();
-    reportSvc.WriteReport(allResults);
-    reportSvc.WriteOverwriteAuditReport(overwriteAuditRows);
-    reportSvc.WriteFailedItems(allResults);
+    var distinctResults = allResults
+        .GroupBy(r => r.SourceFile, StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.Last())
+        .ToList();
+    if (distinctResults.Count != allResults.Count)
+        logger.LogWarning("Migration results deduplicated for summary/report: {Raw} rows -> {Distinct} unique source files.",
+            allResults.Count, distinctResults.Count);
+
+    var runArtifacts = reportSvc.WriteRunArtifacts(distinctResults, overwriteAuditRows);
     // Recompute estimated case-folder count for summary
     var estimatedCaseFolders = 0;
     if (migrationSettings.UseYyyyCaseNumberPath)
@@ -819,8 +925,9 @@ try
         }
         estimatedCaseFolders = cf.Count;
     }
+    var overwriteAuditAlreadyExistsSignals = overwriteAuditRows.Count(r => r.BatchAlreadyExistsSignal);
     reportSvc.PrintSummary(
-        allResults,
+        distinctResults,
         skipped,
         aggregateAlreadyExists,
         records.Count,
@@ -828,12 +935,13 @@ try
         estimatedCaseFolders,
         aggregateOtherErrors,
         migrationSettings.ReportExistingFilesAsOverwritten,
-        BuildSummaryYearLabel(migrationSettings, toMigrate));
-
-    logger.LogInformation(string.Empty);
-    logger.LogInformation("Migration complete! Submitted jobs: {Jobs}, Total files: {Total}", batchesToRun.Count, toMigrate.Count);
-    logger.LogInformation("Conflict summary: AlreadyExists={AlreadyExists}, OtherErrors={OtherErrors}",
-        aggregateAlreadyExists, aggregateOtherErrors);
+        BuildSummaryYearLabel(migrationSettings, toMigrate),
+        toMigrate.Count(r => r.Metadata.ContainsKey("WilberforceFileName")),
+        toMigrate.Count(r => r.Metadata.TryGetValue("WilberforceDate", out var d) && !string.IsNullOrWhiteSpace(d)),
+        overwriteAuditAlreadyExistsSignals,
+        batchesToRun.Count,
+        runLogPath,
+        runArtifacts);
 }
 catch (Exception ex)
 {

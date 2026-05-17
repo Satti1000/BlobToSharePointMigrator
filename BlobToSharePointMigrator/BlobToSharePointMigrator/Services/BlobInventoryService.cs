@@ -33,9 +33,17 @@ public class BlobInventoryService
         var prefix = (_settings.BlobFolderPrefix ?? string.Empty).TrimEnd('/');
         var basePrefix = string.IsNullOrEmpty(prefix) ? string.Empty : prefix + "/";
 
-        var candidatePrefixes = await BuildTargetPrefixesAsync(containerClient, basePrefix);
+        var candidatePrefixes = await BuildTargetPrefixesAsync(containerClient, basePrefix).ConfigureAwait(false);
         if (candidatePrefixes.Count == 0)
         {
+            if (_settings.TryGetMigrationYearScope(out var scopeStart, out var scopeEnd))
+            {
+                _logger.LogWarning(
+                    "No inventory prefixes match migration year scope {Start}-{End} under '{BasePrefix}'. Skipping blob scan (0 files).",
+                    scopeStart, scopeEnd, string.IsNullOrEmpty(basePrefix) ? "(container root)" : basePrefix);
+                return records;
+            }
+
             _logger.LogWarning("No targeted prefixes found under base prefix '{BasePrefix}'. Falling back to full-prefix scan.", basePrefix);
             candidatePrefixes.Add(basePrefix);
         }
@@ -124,7 +132,7 @@ public class BlobInventoryService
         return $"{yearMatch.Groups[1].Value}/{caseTypeMatch.Groups[1].Value}";
     }
 
-    private static async Task<List<string>> BuildTargetPrefixesAsync(BlobContainerClient containerClient, string basePrefix)
+    private async Task<List<string>> BuildTargetPrefixesAsync(BlobContainerClient containerClient, string basePrefix)
     {
         var normalizedBasePrefix = string.IsNullOrWhiteSpace(basePrefix)
             ? string.Empty
@@ -135,6 +143,16 @@ public class BlobInventoryService
             .Where(y => Regex.IsMatch(y, @"^\d{4}$"))
             .OrderBy(y => y, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        if (_settings.TryGetMigrationYearScope(out var scopeStart, out var scopeEnd))
+        {
+            years = years
+                .Where(y => int.TryParse(y, out var yNum) && yNum >= scopeStart && yNum <= scopeEnd)
+                .ToList();
+            _logger.LogInformation(
+                "Inventory year folders limited to Migration year scope {Start}-{End}: {Years}",
+                scopeStart, scopeEnd, years.Count == 0 ? "(none under prefix)" : string.Join(", ", years));
+        }
 
         var prefixes = new List<string>();
         var caseFamilies = new[] { "NRM_Cases_", "DTN_Cases_", "Disqualification_" };
@@ -172,12 +190,17 @@ public class BlobInventoryService
                 // If on year scope, generate all months + families.
                 else if (Regex.IsMatch(last, @"^\d{4}$"))
                 {
-                    for (int month = 1; month <= 12; month++)
+                    var skipYear = _settings.TryGetMigrationYearScope(out var ys, out var ye) &&
+                        (!int.TryParse(last, out var yOnly) || yOnly < ys || yOnly > ye);
+                    if (!skipYear)
                     {
-                        var monthToken = $"M{month:00}";
-                        var yearMonthPrefix = $"{normalizedBasePrefix}{monthToken}/";
-                        foreach (var family in caseFamilies)
-                            prefixes.Add($"{yearMonthPrefix}{family}");
+                        for (int month = 1; month <= 12; month++)
+                        {
+                            var monthToken = $"M{month:00}";
+                            var yearMonthPrefix = $"{normalizedBasePrefix}{monthToken}/";
+                            foreach (var family in caseFamilies)
+                                prefixes.Add($"{yearMonthPrefix}{family}");
+                        }
                     }
                 }
             }

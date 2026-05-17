@@ -14,11 +14,12 @@ public class MigrationSettings
     public string SharePointCaseIdColumnDisplayName     { get; set; } = string.Empty;
     public string SharePointCaseTypeColumnDisplayName   { get; set; } = string.Empty;
     public string SharePointDocumentIdColumnDisplayName { get; set; } = string.Empty;
-    public string SharePointWilerforceDateColumnDisplayName { get; set; } = "Wilerforce Date";
-    public string SharePointWilerforceFileNameColumnDisplayName { get; set; } = "Wilerforce File Name";
+    public string SharePointWilberforceDateColumnDisplayName { get; set; } = "Wilberforce Date";
+    public string SharePointWilberforceFileNameColumnDisplayName { get; set; } = "Wilberforce File Name";
     public string SharePointDocumentLibrary { get; set; } = "Documents";
     public List<string> AllowedExtensions   { get; set; } = new() { ".pdf", ".csv", ".html", ".txt", ".xml" };
     public string MappingFile               { get; set; } = "mapping.json";
+    /// <summary>Single run log file (pipeline output and end-of-run summary).</summary>
     public string LogFile                   { get; set; } = "migration-log.txt";
     public string ReportFile                { get; set; } = "migration-report.csv";
     public string OverwriteAuditReportFile  { get; set; } = "overwrite-audit.csv";
@@ -89,5 +90,28 @@ public class MigrationSettings
     /// encrypted migration package (staging). SharePoint still applies the package asynchronously
     /// via the migration job; set false for very large jobs to reduce log volume.
     /// </summary>
-    public bool LogPerFileCaseProgress { get; set; } = true;
+    public bool LogPerFileCaseProgress { get; set; } = false;
+
+    public bool TryGetMigrationYearScope(out int startYear, out int endYear)
+    {
+        if (MigrationYear > 0)
+        {
+            startYear = MigrationYear;
+            endYear = MigrationYear;
+            return true;
+        }
+
+        if (MigrationYearStart > 0 && MigrationYearEnd > 0)
+        {
+            startYear = MigrationYearStart;
+            endYear = MigrationYearEnd;
+            if (startYear > endYear)
+                (startYear, endYear) = (endYear, startYear);
+            return true;
+        }
+
+        startYear = 0;
+        endYear = 0;
+        return false;
+    }
 }

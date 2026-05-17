@@ -660,6 +660,7 @@ public class SharePointMigrationService
                         else
                         {
                             summary.SawFatalError = true;
+                            summary.SawFinalEvent = true;
                             summary.FatalReason ??= string.IsNullOrWhiteSpace(message) ? "JobFatalError reported by SharePoint Migration API." : message;
                         }
                     }
@@ -1341,7 +1342,7 @@ public class SharePointMigrationService
                 .ToList();
 
             var keysToResolve = new HashSet<string>(requiredKeys, StringComparer.OrdinalIgnoreCase);
-            foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId", "WilerforceDate", "WilerforceFileName" })
+            foreach (var candidate in new[] { "CaseId", "CaseType", "DocumentId", "WilberforceDate", "WilberforceFileName" })
             {
                 if (!string.IsNullOrWhiteSpace(GetMetadataDisplayName(candidate)))
                     keysToResolve.Add(candidate);
@@ -1379,7 +1380,7 @@ public class SharePointMigrationService
                 if (!libraryCache.TryGetValue(metadataKey, out var internalName))
                 {
                     await EnsureSharePointMetadataColumnAsync(libraryTitle, metadataKey, displayName).ConfigureAwait(false);
-                    internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false) ?? string.Empty;
+                    internalName = await ResolveMetadataFieldInternalNameAsync(libraryTitle, metadataKey, displayName).ConfigureAwait(false) ?? string.Empty;
                     libraryCache[metadataKey] = internalName;
                 }
 
@@ -1419,7 +1420,7 @@ public class SharePointMigrationService
         await EnsureCaseMetadataTextFieldAsync(libraryTitle, displayName).ConfigureAwait(false);
     }
 
-    /// <summary>Creates a single-line text column if missing (CaseId, CaseType, DocumentId, Wilerforce fields).</summary>
+    /// <summary>Creates a single-line text column if missing (CaseId, CaseType, DocumentId, Wilberforce fields).</summary>
     private async Task EnsureCaseMetadataTextFieldAsync(string libraryTitle, string displayName)
     {
         if (string.IsNullOrWhiteSpace(displayName))
@@ -1460,14 +1461,29 @@ public class SharePointMigrationService
             return string.IsNullOrWhiteSpace(_settings.SharePointDocumentIdColumnDisplayName)
                 ? "Document ID"
                 : _settings.SharePointDocumentIdColumnDisplayName;
-        if (string.Equals(metadataKey, "WilerforceDate", StringComparison.OrdinalIgnoreCase))
-            return string.IsNullOrWhiteSpace(_settings.SharePointWilerforceDateColumnDisplayName)
-                ? "Wilerforce Date"
-                : _settings.SharePointWilerforceDateColumnDisplayName;
-        if (string.Equals(metadataKey, "WilerforceFileName", StringComparison.OrdinalIgnoreCase))
-            return string.IsNullOrWhiteSpace(_settings.SharePointWilerforceFileNameColumnDisplayName)
-                ? "Wilerforce File Name"
-                : _settings.SharePointWilerforceFileNameColumnDisplayName;
+        if (string.Equals(metadataKey, "WilberforceDate", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointWilberforceDateColumnDisplayName)
+                ? "Wilberforce Date"
+                : _settings.SharePointWilberforceDateColumnDisplayName;
+        if (string.Equals(metadataKey, "WilberforceFileName", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(_settings.SharePointWilberforceFileNameColumnDisplayName)
+                ? "Wilberforce File Name"
+                : _settings.SharePointWilberforceFileNameColumnDisplayName;
+
+        return null;
+    }
+
+    /// <summary>Resolves column internal name; for Wilberforce fields also tries legacy misspelled display names on the library.</summary>
+    private async Task<string?> ResolveMetadataFieldInternalNameAsync(string libraryTitle, string metadataKey, string displayName)
+    {
+        var internalName = await ResolveFieldInternalNameAsync(libraryTitle, displayName).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(internalName))
+            return internalName;
+
+        if (string.Equals(metadataKey, "WilberforceDate", StringComparison.OrdinalIgnoreCase))
+            return await ResolveFieldInternalNameAsync(libraryTitle, "Wilerforce Date").ConfigureAwait(false);
+        if (string.Equals(metadataKey, "WilberforceFileName", StringComparison.OrdinalIgnoreCase))
+            return await ResolveFieldInternalNameAsync(libraryTitle, "Wilerforce File Name").ConfigureAwait(false);
 
         return null;
     }
@@ -1498,17 +1514,8 @@ public class SharePointMigrationService
 
     // ── Bulk CSOM metadata patch ──────────────────────────────────────────────────────────────────
 
-    private static string GetLibraryRelativeFilePath(FileRecord r, string? yearPrefixToStrip)
-    {
-        var path = (r.MappedPath ?? string.Empty).Replace('\\', '/').TrimStart('/');
-        if (!string.IsNullOrEmpty(yearPrefixToStrip))
-        {
-            var prefix = yearPrefixToStrip.TrimEnd('/') + "/";
-            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                path = path[prefix.Length..];
-        }
-        return path.Trim('/');
-    }
+    private static string GetLibraryRelativeFilePath(FileRecord r, string? yearPrefixToStrip) =>
+        MetadataPatchRelativePath(r, yearPrefixToStrip);
 
     private static Dictionary<string, FileRecord> BuildRecordsByNormFileName(IEnumerable<FileRecord> caseGroup, string? yearPrefixToStrip)
     {
@@ -1557,7 +1564,7 @@ public class SharePointMigrationService
 
     /// <summary>
     /// After SPMI jobs complete, patches list item fields: CaseId, CaseType, DocumentId (when matched),
-    /// Wilerforce Date / Wilerforce File Name from enriched <see cref="FileRecord.Metadata"/> (per file via <c>FileLeafRef</c>).
+    /// Wilberforce Date / Wilberforce File Name from enriched <see cref="FileRecord.Metadata"/> (per file via <c>FileLeafRef</c>).
     /// Uses folder-scoped CAML in batches of 100.
     /// </summary>
     /// <param name="records">Records with <see cref="FileRecord.MappedPath"/> and metadata to apply.</param>
@@ -1584,8 +1591,8 @@ public class SharePointMigrationService
             _effectiveMetadataFieldMap.TryGetValue("CaseId", out caseIdField);
             _effectiveMetadataFieldMap.TryGetValue("CaseType", out caseTypeField);
             _effectiveMetadataFieldMap.TryGetValue("DocumentId", out documentIdField);
-            _effectiveMetadataFieldMap.TryGetValue("WilerforceDate", out wilerforceDateField);
-            _effectiveMetadataFieldMap.TryGetValue("WilerforceFileName", out wilerforceFileNameField);
+            _effectiveMetadataFieldMap.TryGetValue("WilberforceDate", out wilerforceDateField);
+            _effectiveMetadataFieldMap.TryGetValue("WilberforceFileName", out wilerforceFileNameField);
         }
         catch (Exception ex)
         {
@@ -1600,6 +1607,24 @@ public class SharePointMigrationService
             _logger.LogInformation("No metadata columns configured for library '{Library}'; skipping bulk metadata patch.", libraryTitle);
             return 0;
         }
+
+        if (string.IsNullOrWhiteSpace(wilerforceFileNameField))
+            _logger.LogWarning(
+                "Wilberforce File Name column could not be resolved in library '{Library}' (display name '{Display}'). File-name metadata will not be patched.",
+                libraryTitle, GetMetadataDisplayName("WilberforceFileName"));
+        if (string.IsNullOrWhiteSpace(wilerforceDateField))
+            _logger.LogWarning(
+                "Wilberforce Date column could not be resolved in library '{Library}' (display name '{Display}'). Manifest dates will not be patched.",
+                libraryTitle, GetMetadataDisplayName("WilberforceDate"));
+
+        var wilberforceFileNameOnRecords = records.Count(r =>
+            r.Metadata.ContainsKey("WilberforceFileName") || r.Metadata.ContainsKey("WilerforceFileName"));
+        var wilberforceDateOnRecords = records.Count(r =>
+            (r.Metadata.TryGetValue("WilberforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd)) ||
+            (r.Metadata.TryGetValue("WilerforceDate", out wd) && !string.IsNullOrWhiteSpace(wd)));
+        _logger.LogInformation(
+            "Wilberforce patch plan for library '{Library}': {FileNameCount} file(s) with file name metadata, {DateCount} with manifest date metadata.",
+            libraryTitle, wilberforceFileNameOnRecords, wilberforceDateOnRecords);
 
         var list = _web.Lists.GetByTitle(libraryTitle);
         _clientContextG.Load(list, l => l.RootFolder.ServerRelativeUrl);
@@ -1726,15 +1751,20 @@ public class SharePointMigrationService
             {
                 if (!string.IsNullOrWhiteSpace(wilerforceFileNameField))
                 {
-                    var wfn = rec.Metadata.TryGetValue("WilerforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                    var wfn = rec.Metadata.TryGetValue("WilberforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
                         ? wfMeta
-                        : rec.Name;
+                        : rec.Metadata.TryGetValue("WilerforceFileName", out wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                            ? wfMeta
+                            : rec.Name;
                     if (!string.IsNullOrWhiteSpace(wfn))
                         item[wilerforceFileNameField] = wfn;
                 }
 
                 if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
-                    rec.Metadata.TryGetValue("WilerforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    rec.Metadata.TryGetValue("WilberforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    item[wilerforceDateField] = wd;
+                else if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
+                         rec.Metadata.TryGetValue("WilerforceDate", out wd) && !string.IsNullOrWhiteSpace(wd))
                     item[wilerforceDateField] = wd;
             }
 
@@ -1886,15 +1916,20 @@ public class SharePointMigrationService
             {
                 if (!string.IsNullOrWhiteSpace(wilerforceFileNameField))
                 {
-                    var wfn = rec.Metadata.TryGetValue("WilerforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                    var wfn = rec.Metadata.TryGetValue("WilberforceFileName", out var wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
                         ? wfMeta
-                        : rec.Name;
+                        : rec.Metadata.TryGetValue("WilerforceFileName", out wfMeta) && !string.IsNullOrWhiteSpace(wfMeta)
+                            ? wfMeta
+                            : rec.Name;
                     if (!string.IsNullOrWhiteSpace(wfn))
                         item[wilerforceFileNameField] = wfn;
                 }
 
                 if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
-                    rec.Metadata.TryGetValue("WilerforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    rec.Metadata.TryGetValue("WilberforceDate", out var wd) && !string.IsNullOrWhiteSpace(wd))
+                    item[wilerforceDateField] = wd;
+                else if (!string.IsNullOrWhiteSpace(wilerforceDateField) &&
+                         rec.Metadata.TryGetValue("WilerforceDate", out wd) && !string.IsNullOrWhiteSpace(wd))
                     item[wilerforceDateField] = wd;
             }
 

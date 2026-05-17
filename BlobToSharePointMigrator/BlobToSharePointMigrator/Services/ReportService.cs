@@ -7,6 +7,14 @@ using CsvHelper;
 
 namespace BlobToSharePointMigrator.Services;
 
+public sealed class RunArtifactsWritten
+{
+    public string? ReportPath { get; set; }
+    public string? FailedItemsPath { get; set; }
+    public string? OverwriteAuditPath { get; set; }
+    public string? DeltaTrackingPath { get; set; }
+}
+
 public class ReportService
 {
     private readonly MigrationSettings _settings;
@@ -45,6 +53,8 @@ public class ReportService
 
     public void SaveDeltaTracking()
     {
+        if (!_settings.DeltaMode)
+            return;
         var json = JsonConvert.SerializeObject(_deltaTracking, Formatting.Indented);
         File.WriteAllText(_settings.DeltaTrackingFile, json);
     }
@@ -54,7 +64,6 @@ public class ReportService
         using var writer = new StreamWriter(_settings.ReportFile);
         using var csv    = new CsvWriter(writer, CultureInfo.InvariantCulture);
         csv.WriteRecords(results);
-        _logger.LogInformation("Report saved: {File}", _settings.ReportFile);
     }
 
     public void WriteFailedItems(List<MigrationResult> results)
@@ -74,24 +83,51 @@ public class ReportService
         using var writer = new StreamWriter(_settings.FailedItemsFile);
         using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
         csv.WriteRecords(failed);
-        _logger.LogInformation("Failed-items file saved: {File} ({Count} rows)",
-            _settings.FailedItemsFile, failed.Count);
     }
 
-    public void WriteOverwriteAuditReport(List<OverwriteAuditRow> rows)
+    public void WriteOverwriteAuditReport(IReadOnlyList<OverwriteAuditRow> rows)
     {
         using var writer = new StreamWriter(_settings.OverwriteAuditReportFile);
         using var csv = new CsvWriter(writer, CultureInfo.InvariantCulture);
         csv.WriteRecords(rows);
+    }
 
-        var overwriteSignalRows = rows.Count(r => r.BatchAlreadyExistsSignal);
-        var patchedEligible = rows.Count(r => r.MetadataPatchEligible);
-        _logger.LogInformation(
-            "Overwrite audit report saved: {File} ({Count} rows, overwrite-signaled rows={OverwriteSignalRows}, metadata-patch-eligible rows={PatchedEligibleRows})",
-            _settings.OverwriteAuditReportFile,
-            rows.Count,
-            overwriteSignalRows,
-            patchedEligible);
+    /// <summary>Writes CSV/JSON artifacts when needed; always leaves the run log as the primary human output.</summary>
+    public RunArtifactsWritten WriteRunArtifacts(
+        List<MigrationResult> results,
+        IReadOnlyList<OverwriteAuditRow> auditRows)
+    {
+        var written = new RunArtifactsWritten();
+
+        if (results.Count > 0)
+        {
+            WriteReport(results);
+            written.ReportPath = _settings.ReportFile;
+        }
+
+        if (results.Any(r => r.Status == "Failed"))
+        {
+            WriteFailedItems(results);
+            written.FailedItemsPath = _settings.FailedItemsFile;
+        }
+        else if (File.Exists(_settings.FailedItemsFile))
+        {
+            File.Delete(_settings.FailedItemsFile);
+        }
+
+        if (_settings.ReportExistingFilesAsOverwritten && auditRows.Count > 0)
+        {
+            WriteOverwriteAuditReport(auditRows);
+            written.OverwriteAuditPath = _settings.OverwriteAuditReportFile;
+        }
+
+        if (_settings.DeltaMode)
+        {
+            SaveDeltaTracking();
+            written.DeltaTrackingPath = _settings.DeltaTrackingFile;
+        }
+
+        return written;
     }
 
     public HashSet<string> LoadFailedSourceFiles()
@@ -114,89 +150,290 @@ public class ReportService
     public void PrintSummary(
         List<MigrationResult> results,
         List<FileRecord> skipped,
-        int alreadyExistsConflicts = 0,
-        int blobsListed = 0,
-        int filesPlannedToMigrate = 0,
-        int estimatedCaseFolders = 0,
-        int otherErrorConflicts = 0,
-        bool reportExistingFilesAsOverwritten = false,
-        string? summaryYearLabel = null)
+        int spmiQueueAlreadyExistsEvents,
+        int blobsListed,
+        int filesPlannedToMigrate,
+        int estimatedCaseFolders,
+        int spmiQueueOtherErrors,
+        bool reportExistingFilesAsOverwritten,
+        string? summaryYearLabel,
+        int wilberforceFileNameOnPlan,
+        int wilberforceDateOnPlan,
+        int overwriteAuditAlreadyExistsSignalRows = 0,
+        int jobsSubmitted = 0,
+        string? runLogPath = null,
+        RunArtifactsWritten? artifacts = null,
+        int? metadataPatchedCount = null)
     {
-        var success  = results.Count(r => r.Status == "Success");
-        var partial  = results.Count(r => r.Status == "PartialSuccess");
-        var failed   = results.Count(r => r.Status == "Failed");
-        var migrated = success + partial;
+        var stats = RunSummaryStats.FromResults(
+            results,
+            skipped.Count,
+            blobsListed,
+            filesPlannedToMigrate,
+            spmiQueueAlreadyExistsEvents,
+            spmiQueueOtherErrors,
+            overwriteAuditAlreadyExistsSignalRows,
+            wilberforceFileNameOnPlan,
+            wilberforceDateOnPlan);
 
-        static bool ContainsAny(string source, params string[] needles)
+        LogSummaryBlock(results, stats, summaryYearLabel, reportExistingFilesAsOverwritten, estimatedCaseFolders, jobsSubmitted,
+            runLogPath, artifacts, metadataPatchedCount);
+
+        if (!stats.CountsReconcile)
         {
-            if (string.IsNullOrWhiteSpace(source))
-                return false;
-            foreach (var needle in needles)
-            {
-                if (source.Contains(needle, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-            return false;
+            _logger.LogWarning(
+                "Summary count mismatch: Success({Success}) + PartialSuccess({Partial}) + Failed({Failed}) + Other({Other}) != {ResultRows} result rows.",
+                stats.Success, stats.PartialSuccess, stats.Failed, stats.OtherStatus, stats.ResultRows);
         }
 
-        var failedAlreadyExistsRows = results.Count(r =>
-            r.Status == "Failed" &&
-            ContainsAny(r.Error, "already exists", "same name already exists", "a file with the same name"));
-        var failedOverwriteRows = results.Count(r =>
-            r.Status == "Failed" &&
-            ContainsAny(r.Error, "save conflict", "conflict with those made concurrently", "overwrite"));
-        var overwriteSignalRows = reportExistingFilesAsOverwritten ? alreadyExistsConflicts : 0;
-        var sourceScope = string.IsNullOrWhiteSpace(_settings.BlobFolderPrefix)
-            ? "(container root / full configured scope)"
-            : _settings.BlobFolderPrefix.Replace('\\', '/').Trim('/');
+        if (stats.PlannedWithoutResult > 0)
+        {
+            _logger.LogWarning(
+                "Summary: {Missing} planned file(s) have no result row (not submitted or missing from batch results).",
+                stats.PlannedWithoutResult);
+        }
+    }
 
-        // Build summary block styled after Application 1.
-        // Logged via _logger (appears in log files) AND Console.WriteLine (appears in terminal).
-        var lines = new System.Text.StringBuilder();
-        lines.AppendLine();
-        lines.AppendLine("========== BlobToSharePointSync run summary ==========");
+    private void LogSummaryBlock(
+        IReadOnlyList<MigrationResult> results,
+        RunSummaryStats stats,
+        string? summaryYearLabel,
+        bool reportExistingFilesAsOverwritten,
+        int estimatedCaseFolders,
+        int jobsSubmitted,
+        string? runLogPath,
+        RunArtifactsWritten? artifacts,
+        int? metadataPatchedCount)
+    {
+        void Line(string text) => _logger.LogInformation("{SummaryLine}", text);
+        var reportPath = artifacts?.ReportPath ?? _settings.ReportFile;
+        var failedListPath = artifacts?.FailedItemsPath ?? _settings.FailedItemsFile;
+
+        Line(string.Empty);
+        Line("========== BlobToSharePointSync — run summary ==========");
         if (!string.IsNullOrWhiteSpace(summaryYearLabel))
-            lines.AppendLine($"  Year (YYYY scope):                   {summaryYearLabel}");
-        if (blobsListed > 0)            lines.AppendLine($"  Blobs listed (container/prefix):     {blobsListed}");
-        lines.AppendLine($"  Skipped (invalid/filtered):          {skipped.Count}");
-        if (reportExistingFilesAsOverwritten && alreadyExistsConflicts > 0)
-            lines.AppendLine($"  Already exists (reported as overwritten): {alreadyExistsConflicts}");
-        else
-            lines.AppendLine($"  Skipped (already exists in target):       {alreadyExistsConflicts}");
-        if (filesPlannedToMigrate > 0) lines.AppendLine($"  Files planned to migrate:            {filesPlannedToMigrate}");
-        lines.AppendLine($"  Files uploaded successfully:         {success + partial}  (this run only — per-blob row status)");
-        lines.AppendLine($"  Failed uploads:                      {failed}");
-        lines.AppendLine("  Note: SharePoint library item counts can exceed the rows above (previous migrations,");
-        lines.AppendLine("         folders, or how the library UI counts items). SPMI queue \"FilesCreated\" is not a library census.");
+            Line($"  Year (YYYY scope):                   {summaryYearLabel}");
+        if (jobsSubmitted > 0)
+            Line($"  SPMI jobs submitted:                 {jobsSubmitted}");
+        if (stats.BlobsListed > 0)
+            Line($"  Blobs listed (inventory):            {stats.BlobsListed}");
+        Line($"  Skipped (invalid/filtered):          {stats.SkippedInvalid}");
+        if (stats.FilesPlanned > 0)
+            Line($"  Files planned to migrate:            {stats.FilesPlanned}");
         if (estimatedCaseFolders > 0)
-            lines.AppendLine($"  Unique case folders in plan (YYYY/Case): {estimatedCaseFolders}");
-        lines.AppendLine($"  Other errors (non-existence):        {otherErrorConflicts}");
-        lines.AppendLine("======================================================");
-        lines.AppendLine("Comparison after migration:");
-        lines.AppendLine();
-        lines.AppendLine($"  Blob path where files come from:      {sourceScope}");
-        lines.AppendLine($"  Total files present on blob scope:    {Math.Max(0, blobsListed - skipped.Count)}");
-        lines.AppendLine($"  Total files migrated to SP:           {migrated}");
-        lines.AppendLine($"  Total files failed to migrate to SP:  {failed}");
-        lines.AppendLine();
-        lines.AppendLine($"  Total files already-exists on SP:     {alreadyExistsConflicts}");
-        lines.AppendLine($"  Total files overwrite-signaled on SP: {overwriteSignalRows}");
-        lines.AppendLine($"  Total files failed to overwrite:      {failedOverwriteRows + failedAlreadyExistsRows}");
-        lines.AppendLine();
-        lines.AppendLine($"  Failure details log:                  {_settings.ReportFile}");
-        lines.AppendLine($"  Retry input file:                     {_settings.FailedItemsFile}");
-        lines.AppendLine($"  Retry failed-only flag:               Migration:RetryFailedOnly=true");
-        lines.AppendLine("======================================================");
-        lines.AppendLine($"  Report saved:      {_settings.ReportFile}");
-        lines.AppendLine($"  Overwrite audit:   {_settings.OverwriteAuditReportFile}");
-        lines.AppendLine($"  Failed-items file: {_settings.FailedItemsFile}");
-        lines.Append    ("======================================================");
+            Line($"  Estimated case folders (YYYY/nnn):   {estimatedCaseFolders}");
+        Line($"  Per-file result rows:                {stats.ResultRows}");
+        if (stats.PlannedWithoutResult > 0)
+            Line($"  Planned with no result row:          {stats.PlannedWithoutResult}");
+        Line(string.Empty);
+        Line("  Per-file outcomes:");
+        Line($"    Success:                           {stats.Success}");
+        Line($"    PartialSuccess:                    {stats.PartialSuccess}");
+        Line($"    Failed:                            {stats.Failed}");
+        if (stats.OtherStatus > 0)
+            Line($"    Other status (e.g. metadata-only): {stats.OtherStatus}");
+        if (stats.Failed > 0)
+        {
+            if (stats.FailedSaveConflict > 0)
+                Line($"      — Save Conflict:                 {stats.FailedSaveConflict}");
+            if (stats.FailedDestinationAlreadyExists > 0)
+                Line($"      — Destination already exists:    {stats.FailedDestinationAlreadyExists}");
+            if (stats.FailedOther > 0)
+                Line($"      — Other errors:                  {stats.FailedOther}");
+        }
+        Line($"  Uploaded (Success + PartialSuccess): {stats.Uploaded}");
+        if (stats.CountsReconcile && stats.ResultRows > 0)
+            Line($"  Count check:                       Success+Partial+Failed+Other = {stats.ResultRows} (matches {reportPath})");
+        else if (stats.ResultRows > 0)
+            Line("  Count check:                       WARNING — outcome counts do not add up to result rows; use report CSV.");
+        if (stats.AllPlannedFailed)
+            Line("  Note: Every planned file is Failed in this run.");
+        LogPerFileOutcomeIndex(results, stats, reportPath, failedListPath, Line);
+        Line(string.Empty);
+        Line("  SPMI queue signals (batch-level, not per-file skips):");
+        Line($"    Already-exists messages:           {stats.SpmiQueueAlreadyExistsEvents}");
+        Line($"    Other non-existence errors:        {stats.SpmiQueueOtherErrors}");
+        if (stats.OverwriteAuditAlreadyExistsSignalRows > 0)
+            Line($"  Overwrite-audit batch already-exists signals: {stats.OverwriteAuditAlreadyExistsSignalRows}");
+        if (reportExistingFilesAsOverwritten && stats.SpmiQueueAlreadyExistsEvents > 0)
+            Line("  (ReportExistingFilesAsOverwritten=true: queue already-exists treated as overwrite intent.)");
+        if (stats.WilberforceFileNameOnPlan > 0 || stats.WilberforceDateOnPlan > 0)
+        {
+            Line(string.Empty);
+            Line("  Metadata on plan (before SharePoint patch):");
+            Line($"    Wilberforce File Name:             {stats.WilberforceFileNameOnPlan}");
+            Line($"    Wilberforce Date:                  {stats.WilberforceDateOnPlan}");
+        }
+        if (metadataPatchedCount.HasValue)
+            Line($"  Metadata-only list items patched:  {metadataPatchedCount.Value}");
+        Line(string.Empty);
+        if (!string.IsNullOrWhiteSpace(runLogPath))
+            Line($"  Run log:                           {runLogPath}");
+        if (artifacts is not null)
+        {
+            var dataFiles = new List<string>();
+            if (!string.IsNullOrWhiteSpace(artifacts.ReportPath)) dataFiles.Add(artifacts.ReportPath);
+            if (!string.IsNullOrWhiteSpace(artifacts.FailedItemsPath)) dataFiles.Add(artifacts.FailedItemsPath);
+            if (!string.IsNullOrWhiteSpace(artifacts.OverwriteAuditPath)) dataFiles.Add(artifacts.OverwriteAuditPath);
+            if (!string.IsNullOrWhiteSpace(artifacts.DeltaTrackingPath)) dataFiles.Add(artifacts.DeltaTrackingPath);
+            if (dataFiles.Count > 0)
+                Line($"  Data exports (CSV/JSON):           {string.Join(", ", dataFiles)}");
+        }
+        Line("======================================================");
+        Line("Migration complete.");
+    }
 
-        var summary = lines.ToString();
-        // Single logger emission avoids duplicate blocks when console + file sinks both capture output.
-        _logger.LogInformation("{Summary}", summary);
-        // Per-file detail is already captured in the CSV report files; omit it here to keep
-        // console output clean and prevent 10k+ lines from burying the summary.
+    private static void LogPerFileOutcomeIndex(
+        IReadOnlyList<MigrationResult> results,
+        RunSummaryStats stats,
+        string reportPath,
+        string failedListPath,
+        Action<string> line)
+    {
+        const int maxFailedLinesInLog = 40;
+
+        line(string.Empty);
+        line("  Per-file results (exact Status per row):");
+        line($"    Report CSV:                        {reportPath}");
+        line("      Status=Success         — file treated as migrated successfully");
+        line("      Status=PartialSuccess  — SPMI completed with errors; row not Failed (metadata patch may still run)");
+        line("      Status=Failed          — file failed for this run (see Error column)");
+
+        if (stats.Uploaded > 0)
+        {
+            line($"    Succeeded (Success+Partial):         {stats.Uploaded} row(s) — open report CSV, filter Status column");
+        }
+
+        var failedRows = results
+            .Where(r => string.Equals(r.Status, "Failed", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (failedRows.Count == 0)
+            return;
+
+        line($"    Failed:                              {failedRows.Count} row(s)");
+        if (failedRows.Count <= maxFailedLinesInLog)
+        {
+            foreach (var r in failedRows)
+            {
+                var err = string.IsNullOrWhiteSpace(r.Error) ? "(no error text)" : TruncateError(r.Error, 160);
+                line($"      FAILED | {r.SourceFile}");
+                line($"             | {err}");
+            }
+        }
+        else
+        {
+            foreach (var r in failedRows.Take(maxFailedLinesInLog))
+            {
+                var err = string.IsNullOrWhiteSpace(r.Error) ? "(no error text)" : TruncateError(r.Error, 120);
+                line($"      FAILED | {r.SourceFile} | {err}");
+            }
+            line($"      ... and {failedRows.Count - maxFailedLinesInLog} more Failed row(s) in {failedListPath}");
+        }
+    }
+
+    private static string TruncateError(string error, int maxLen) =>
+        error.Length <= maxLen ? error : error[..maxLen] + "…";
+
+    private sealed class RunSummaryStats
+    {
+        internal static RunSummaryStats FromResults(
+            IReadOnlyList<MigrationResult> results,
+            int skippedInvalid,
+            int blobsListed,
+            int filesPlanned,
+            int spmiQueueAlreadyExistsEvents,
+            int spmiQueueOtherErrors,
+            int overwriteAuditAlreadyExistsSignalRows,
+            int wilberforceFileNameOnPlan,
+            int wilberforceDateOnPlan)
+        {
+            static bool ContainsAny(string? source, params string[] needles)
+            {
+                if (string.IsNullOrWhiteSpace(source))
+                    return false;
+                foreach (var needle in needles)
+                {
+                    if (source.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                return false;
+            }
+
+            var success = 0;
+            var partial = 0;
+            var failed = 0;
+            var otherStatus = 0;
+            var failedSaveConflict = 0;
+            var failedAlreadyExists = 0;
+            var failedOther = 0;
+
+            foreach (var r in results)
+            {
+                switch (r.Status)
+                {
+                    case "Success":
+                        success++;
+                        break;
+                    case "PartialSuccess":
+                        partial++;
+                        break;
+                    case "Failed":
+                        failed++;
+                        if (ContainsAny(r.Error, "save conflict", "conflict with those made concurrently"))
+                            failedSaveConflict++;
+                        else if (ContainsAny(r.Error, "already exists", "same name already exists", "a file with the same name"))
+                            failedAlreadyExists++;
+                        else
+                            failedOther++;
+                        break;
+                    default:
+                        otherStatus++;
+                        break;
+                }
+            }
+
+            return new RunSummaryStats
+            {
+                BlobsListed = blobsListed,
+                SkippedInvalid = skippedInvalid,
+                FilesPlanned = filesPlanned,
+                ResultRows = results.Count,
+                Success = success,
+                PartialSuccess = partial,
+                Failed = failed,
+                FailedSaveConflict = failedSaveConflict,
+                FailedDestinationAlreadyExists = failedAlreadyExists,
+                FailedOther = failedOther,
+                OtherStatus = otherStatus,
+                SpmiQueueAlreadyExistsEvents = spmiQueueAlreadyExistsEvents,
+                SpmiQueueOtherErrors = spmiQueueOtherErrors,
+                OverwriteAuditAlreadyExistsSignalRows = overwriteAuditAlreadyExistsSignalRows,
+                WilberforceFileNameOnPlan = wilberforceFileNameOnPlan,
+                WilberforceDateOnPlan = wilberforceDateOnPlan
+            };
+        }
+
+        public int BlobsListed { get; init; }
+        public int SkippedInvalid { get; init; }
+        public int FilesPlanned { get; init; }
+        public int ResultRows { get; init; }
+        public int Success { get; init; }
+        public int PartialSuccess { get; init; }
+        public int Failed { get; init; }
+        public int FailedSaveConflict { get; init; }
+        public int FailedDestinationAlreadyExists { get; init; }
+        public int FailedOther { get; init; }
+        public int OtherStatus { get; init; }
+        public int SpmiQueueAlreadyExistsEvents { get; init; }
+        public int SpmiQueueOtherErrors { get; init; }
+        public int OverwriteAuditAlreadyExistsSignalRows { get; init; }
+        public int WilberforceFileNameOnPlan { get; init; }
+        public int WilberforceDateOnPlan { get; init; }
+        public int Uploaded => Success + PartialSuccess;
+        public int PlannedWithoutResult => Math.Max(0, FilesPlanned - ResultRows);
+        public bool AllPlannedFailed => FilesPlanned > 0 && Failed == FilesPlanned && Uploaded == 0;
+        public bool CountsReconcile =>
+            ResultRows == 0 || Success + PartialSuccess + Failed + OtherStatus == ResultRows;
     }
 
     private sealed class FailedItemRow
